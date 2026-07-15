@@ -32,7 +32,7 @@ jobs:
 
       - name: Download ETF holdings
         run: |
-          python scrape_etf_holdings.py \
+          python update_holdings.py \
             --out-dir data \
             --no-per-fund \
             --combined-name ETF_Holdings_Latest.csv \
