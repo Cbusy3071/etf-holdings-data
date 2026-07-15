@@ -1,10 +1,8 @@
 name: Update ETF Holdings
 
 on:
-  # Allows you to test it manually from the Actions tab.
   workflow_dispatch:
 
-  # Runs every Monday at 6:07 am Sydney time.
   schedule:
     - cron: "7 6 * * 1"
       timezone: "Australia/Sydney"
@@ -18,17 +16,31 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+          cache: pip
 
-      - name: Generate holdings CSV
-        run: python update_holdings.py
+      - name: Install dependencies
+        run: pip install pandas requests
+
+      - name: Create output directory
+        run: mkdir -p data
+
+      - name: Download ETF holdings
+        run: |
+          python scrape_etf_holdings.py \
+            --out-dir data \
+            --no-per-fund \
+            --combined-name ETF_Holdings_Latest.csv \
+            VGT ACWI XLF XLI XLC PPH MLPX GRID SOXQ
+
+      - name: Confirm output exists
+        run: |
+          test -s data/ETF_Holdings_Latest.csv
 
       - name: Commit updated CSV
         run: |
@@ -38,8 +50,8 @@ jobs:
           git add data/ETF_Holdings_Latest.csv
 
           if git diff --cached --quiet; then
-            echo "No changes detected."
+            echo "No holdings changes detected."
           else
-            git commit -m "Update ETF holdings $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git commit -m "Update ETF holdings $(date -u +'%Y-%m-%d')"
             git push
           fi
