@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
 
   schedule:
-  - cron: "7 10 * * 2-6"
-    timezone: "Australia/Sydney"
+  - cron: "7 0 * * 2-6"  # 10:07 Australia/Sydney during AEST (UTC+10)
+  - cron: "7 23 * * 1-5" # 10:07 Australia/Sydney during AEDT (UTC+11)
 
 permissions:
   contents: write
