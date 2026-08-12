@@ -3,14 +3,15 @@
 GitHub-Actions-friendly ETF holdings puller.
 
 Fallback hierarchy (best -> worst):
-    1. Barchart
-    2. Vested Finance
-    3. FinanceCharts
-    4. Zacks
-    5. CompaniesMarketCap
-    6. Schwab
-    7. FindBillion
-    8. Existing last-known-good rows from ETF_Holdings_Latest.csv
+    1. Pineify (experimental free full-holdings source)
+    2. Barchart
+    3. Vested Finance
+    4. FinanceCharts
+    5. Zacks
+    6. CompaniesMarketCap
+    7. Schwab
+    8. FindBillion
+    9. Existing last-known-good rows from ETF_Holdings_Latest.csv
 
 The script keeps the existing 10-column CSV schema used by Excel/Power Query.
 A source is accepted only after completeness and weight validation. HTML markup in
@@ -414,6 +415,161 @@ def fetch_zacks(session: requests.Session, ticker: str, timeout_seconds: int) ->
     return pd.DataFrame.from_records(records)
 
 
+
+def _walk_json_lists(value: Any):
+    """Yield nested lists of dictionaries from an arbitrary JSON payload."""
+    if isinstance(value, list):
+        if value and all(isinstance(item, dict) for item in value):
+            yield value
+        for item in value:
+            yield from _walk_json_lists(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _walk_json_lists(item)
+
+
+def _pineify_payload_to_frame(payload: Any, ticker: str) -> pd.DataFrame:
+    """Normalize Pineify-like JSON without depending on one exact wrapper schema."""
+    ticker_keys = ("asset", "symbol", "ticker", "holdingTicker", "holding_ticker")
+    name_keys = ("name", "assetName", "holdingName", "holding_name", "companyName")
+    weight_keys = ("weightPercentage", "weight_percent", "weightPercent", "weight", "percentage")
+    shares_keys = ("sharesNumber", "sharesHeld", "shares_held", "shares", "quantity")
+    value_keys = ("marketValue", "market_value", "marketValueUsd", "market_value_usd", "value")
+
+    best: list[dict[str, Any]] | None = None
+    best_score = -1
+    for rows in _walk_json_lists(payload):
+        if not rows:
+            continue
+        sample = rows[: min(25, len(rows))]
+        score = 0
+        for row in sample:
+            keys = set(row)
+            if any(k in keys for k in ticker_keys):
+                score += 3
+            if any(k in keys for k in weight_keys):
+                score += 3
+            if any(k in keys for k in shares_keys):
+                score += 1
+            if any(k in keys for k in value_keys):
+                score += 2
+        if score > best_score:
+            best_score = score
+            best = rows
+
+    if not best or best_score <= 0:
+        raise HoldingsError(f"No Pineify holdings records found for {ticker}")
+
+    def pick(row: dict[str, Any], keys: tuple[str, ...]) -> Any:
+        for key in keys:
+            if key in row and row[key] not in (None, ""):
+                return row[key]
+        return None
+
+    records: list[dict[str, Any]] = []
+    for row in best:
+        holding_ticker = pick(row, ticker_keys)
+        weight = pick(row, weight_keys)
+        market_value = pick(row, value_keys)
+        shares = pick(row, shares_keys)
+        name = pick(row, name_keys)
+        if holding_ticker in (None, ""):
+            continue
+        records.append(
+            {
+                "holding_ticker": holding_ticker,
+                "holding_name": name,
+                "weight": weight,
+                "shares_held": shares,
+                "market_value_usd": market_value,
+            }
+        )
+
+    if not records:
+        raise HoldingsError(f"No usable Pineify holdings rows for {ticker}")
+
+    frame = pd.DataFrame.from_records(records)
+    frame["weight"] = numeric_series(frame["weight"])
+    frame["shares_held"] = numeric_series(frame["shares_held"])
+    frame["market_value_usd"] = numeric_series(frame["market_value_usd"])
+
+    # Pineify advertises a market value for every holding. If the response really
+    # supplies one for every row, calculate weights ourselves from those values
+    # instead of keeping a rounded website percentage. This preserves much finer
+    # precision for small positions. If even one market value is missing, keep
+    # Pineify's supplied weight rather than distort the denominator.
+    if len(frame) and frame["market_value_usd"].notna().all():
+        total_market_value = float(frame["market_value_usd"].sum())
+        if total_market_value > 0:
+            frame["weight"] = frame["market_value_usd"] / total_market_value * 100.0
+
+    return frame
+
+
+def fetch_pineify(session: requests.Session, ticker: str, timeout_seconds: int) -> pd.DataFrame:
+    """Try Pineify's free holdings service without making it a hard dependency.
+
+    Pineify publicly advertises complete daily holdings with ticker, name, CUSIP,
+    shares, weight and market value, but does not currently document a public API.
+    Its web tooling uses Pineify API hostnames, so this fetcher tries a small set
+    of read-only holdings routes and validates any JSON returned. If those routes
+    change or block automation, the normal source chain simply falls through.
+    """
+    ticker = ticker.strip().upper()
+
+    roots = (
+        "https://pineify-api.pineify.app",
+        "https://pineifyapi.pineify.app",
+    )
+    path_templates = (
+        "/api/fund-holdings/{ticker}",
+        "/fund-holdings/{ticker}",
+        "/api/etf-holdings/{ticker}",
+        "/etf-holdings/{ticker}",
+        "/api/fund/holdings/{ticker}",
+        "/api/etf/holdings/{ticker}",
+    )
+
+    errors: list[str] = []
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://pineify.app/etf-fund-holdings",
+        "Origin": "https://pineify.app",
+    }
+
+    for root in roots:
+        for template in path_templates:
+            url = root + template.format(ticker=ticker)
+            try:
+                response = session.get(url, timeout=(10, timeout_seconds), headers=headers)
+                if response.status_code in {401, 403, 404, 405}:
+                    errors.append(f"{response.status_code} {url}")
+                    continue
+                response.raise_for_status()
+                content_type = response.headers.get("content-type", "").lower()
+                if "json" not in content_type and not response.text.lstrip().startswith(("{", "[")):
+                    errors.append(f"non-JSON {url}")
+                    continue
+                payload = response.json()
+                return _pineify_payload_to_frame(payload, ticker)
+            except Exception as exc:
+                errors.append(f"{url}: {exc}")
+
+    # Final non-invasive attempt: if Pineify ever starts server-rendering a
+    # symbol query, the existing HTML table parser will pick it up automatically.
+    try:
+        return fetch_html_source(
+            session,
+            ticker,
+            timeout_seconds,
+            "Pineify",
+            f"https://pineify.app/etf-fund-holdings?symbol={ticker}",
+        )
+    except Exception as exc:
+        errors.append(f"public page: {exc}")
+
+    raise HoldingsError("Pineify routes unavailable: " + " | ".join(errors[-6:]))
+
 def fetch_barchart(session: requests.Session, ticker: str, timeout_seconds: int) -> pd.DataFrame:
     api_key = os.getenv("BARCHART_API_KEY", "").strip()
     if api_key:
@@ -605,6 +761,7 @@ def load_previous(combined_path: Path) -> dict[str, pd.DataFrame]:
 
 Fetcher = Callable[[requests.Session, str, int], pd.DataFrame]
 SOURCE_CHAIN: list[tuple[str, Fetcher]] = [
+    ("Pineify", fetch_pineify),
     ("Barchart", fetch_barchart),
     ("Vested", fetch_vested),
     ("FinanceCharts", fetch_financecharts),
