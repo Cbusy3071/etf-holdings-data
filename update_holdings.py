@@ -56,9 +56,11 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from urllib.parse import urljoin
 
 import pandas as pd
 import requests
+from lxml import html as lxml_html
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -147,12 +149,18 @@ SSGA_URL = (
 )
 
 ISHARES_ACWI_URLS = [
-    "https://www.ishares.com/us/products/239600/ishares-msci-acwi-etf/"
-    "1467271812596.ajax?fileType=csv&fileName=ACWI_holdings&dataType=fund",
+    # Current official iShares download linked from the ACWI fund page.
+    "https://www.ishares.com/us/products/239600/ishares-msci-acwi-etf/latest-holdings.csv",
 ]
 
-# Invesco changes this export route occasionally. The fetcher rejects HTML
-# redirects/generic pages so a changed endpoint cannot be mistaken for holdings.
+INVESCO_PAGE_URL = (
+    "https://www.invesco.com/us/en/financial-products/etfs/"
+    "invesco-phlx-semiconductor-etf.html"
+)
+
+# Legacy official export route is retained as a best-effort attempt after first
+# visiting the product page to establish cookies. If Invesco changes it again,
+# the run falls back to last-known-good rather than publishing a partial table.
 INVESCO_URLS = [
     (
         "https://www.invesco.com/us/financial-products/etfs/holdings/main/"
@@ -160,19 +168,16 @@ INVESCO_URLS = [
     ),
 ]
 
-GLOBALX_URLS = [
-    "https://www.globalxetfs.com/funds/{t}/?download_full_holdings=true",
-    "https://assets.globalxetfs.com/fund-docs/holdings/{t}_full_holdings.csv",
-]
+GLOBALX_PAGE_URL = "https://www.globalxetfs.com/funds/{t}"
 
 FIRSTTRUST_URLS = [
     "https://www.ftportfolios.com/Retail/Etf/EtfHoldings.aspx?Ticker={t}",
 ]
 
-VANECK_URLS = [
-    "https://www.vaneck.com/us/en/investments/pharmaceutical-etf-pph/holdings/?format=csv",
-    "https://www.vaneck.com/us/en/investments/pharmaceutical-etf-pph/holdings/",
-]
+VANECK_PAGE_URL = (
+    "https://www.vaneck.com/us/en/investments/"
+    "pharmaceutical-etf-pph/holdings/"
+)
 
 VANGUARD_URLS = [
     "https://investor.vanguard.com/investment-products/etfs/profile/api/"
@@ -456,16 +461,34 @@ def standardise(
 def drop_nonsecurity_rows(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["raw_ticker"] = out["raw_ticker"].map(clean_text)
+    out["raw_name"] = out["raw_name"].map(clean_text)
 
     # The existing Excel model is security/ticker based, so blank-ticker cash,
     # FX and derivative rows are excluded from the holdings stream.
     out = out[out["raw_ticker"] != ""].copy()
 
-    # Remove obvious repeated headers/disclaimers.
-    bad = out["raw_ticker"].str.upper().isin(
-        {"TICKER", "SYMBOL", "N/A", "NA", "NONE"}
+    ticker_upper = out["raw_ticker"].str.upper()
+    name_upper = out["raw_name"].str.upper()
+
+    # Remove obvious repeated headers/disclaimers and provider cash/FX lines.
+    bad = ticker_upper.isin(
+        {
+            "TICKER", "SYMBOL", "N/A", "NA", "NONE", "--",
+            "USD", "EUR", "GBP", "CHF", "CAD", "AUD", "JPY", "HKD",
+            "CNY", "TWD", "KRW",
+        }
     )
-    out = out[~bad].copy()
+    cash_fx = (
+        ticker_upper.str.startswith("$")
+        | ticker_upper.str.contains(r"CASH", regex=True)
+        | name_upper.str.fullmatch(
+            r"(US DOLLAR|EURO|POUND STERLING|SWISS FRANC|"
+            r"HONG KONG DOLLAR|YUAN RENMINBI|BRAZILIAN REAL|"
+            r"NEW TAIWAN DOLLAR|OTHER/CASH|CASH)",
+            na=False,
+        )
+    )
+    out = out[~(bad | cash_fx)].copy()
     return out.reset_index(drop=True)
 
 
@@ -483,12 +506,216 @@ def maybe_recompute_from_market_value(
         return out, "provider_weight"
 
     mval = pd.to_numeric(out["market_value"], errors="coerce")
-    if mval.notna().all() and (mval >= 0).all() and float(mval.sum()) > 0:
+    if mval.notna().all() and float(mval.sum()) > 0:
         total = float(mval.sum())
         out["weight"] = mval / total * 100.0
         return out, "market_value_recomputed"
 
     return out, "provider_weight"
+
+
+
+def find_download_link(
+    html_text: str,
+    base_url: str,
+    *,
+    text_contains: tuple[str, ...] = (),
+    href_contains: tuple[str, ...] = (),
+) -> str | None:
+    """Return the first matching absolute link from provider HTML."""
+    try:
+        root = lxml_html.fromstring(html_text)
+    except Exception:
+        return None
+
+    text_tokens = tuple(t.lower() for t in text_contains)
+    href_tokens = tuple(t.lower() for t in href_contains)
+
+    ranked: list[tuple[int, str]] = []
+    for a in root.xpath("//a[@href]"):
+        href = clean_text(a.get("href"))
+        if not href or href.lower().startswith(("javascript:", "mailto:", "#")):
+            continue
+        label = " ".join(clean_text(x) for x in a.itertext()).strip().lower()
+        href_low = href.lower()
+
+        text_ok = not text_tokens or all(t in label for t in text_tokens)
+        href_ok = not href_tokens or all(t in href_low for t in href_tokens)
+        if not (text_ok and href_ok):
+            continue
+
+        score = 0
+        if "download" in label:
+            score += 3
+        if "full holdings" in label:
+            score += 3
+        if href_low.endswith((".csv", ".xls", ".xlsx")):
+            score += 3
+        if "holding" in href_low:
+            score += 1
+        ranked.append((score, urljoin(base_url, href)))
+
+    if not ranked:
+        return None
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    return ranked[0][1]
+
+
+def excel_with_detected_header(
+    content: bytes,
+    *,
+    required_tokens: tuple[str, ...] = ("ticker",),
+    max_scan_rows: int = 40,
+) -> tuple[pd.DataFrame, str | None]:
+    """Parse a provider XLS/XLSX whose metadata precedes the real header."""
+    raw = pd.read_excel(io.BytesIO(content), header=None, dtype=str)
+
+    hdr = None
+    for i in range(min(max_scan_rows, len(raw))):
+        joined = " | ".join(clean_text(v).lower() for v in raw.iloc[i].tolist())
+        if all(tok.lower() in joined for tok in required_tokens):
+            hdr = i
+            break
+
+    if hdr is None:
+        raise HoldingsError(
+            f"Could not find Excel header containing {required_tokens}"
+        )
+
+    source_date = None
+    for i in range(hdr):
+        row_text = " ".join(clean_text(v) for v in raw.iloc[i].tolist())
+        parsed = extract_date_from_text(row_text)
+        if parsed:
+            source_date = parsed
+            break
+
+    df = raw.iloc[hdr + 1 :].copy()
+    df.columns = [clean_text(c) for c in raw.iloc[hdr].tolist()]
+    return df, source_date
+
+
+ISHARES_EXCHANGE_SUFFIX = {
+    "Taiwan Stock Exchange": ".TW",
+    "Korea Exchange (Stock Market)": ".KS",
+    "Tokyo Stock Exchange": ".T",
+    "Hong Kong Exchanges And Clearing Ltd": ".HK",
+    "London Stock Exchange": ".L",
+    "Euronext Amsterdam": ".AS",
+    "SIX Swiss Exchange": ".SW",
+    "Xetra": ".DE",
+    "Nyse Euronext - Euronext Paris": ".PA",
+    "Toronto Stock Exchange": ".TO",
+    "Asx - All Markets": ".AX",
+    "Bolsa De Madrid": ".MC",
+    "Borsa Italiana": ".MI",
+    "Nasdaq Omx Helsinki Ltd.": ".HE",
+    "Nasdaq Omx Stockholm": ".ST",
+    "Nasdaq Omx Nordic": ".ST",
+    "Nasdaq Omx Copenhagen": ".CO",
+    "Oslo Bors Asa": ".OL",
+    "Euronext Brussels": ".BR",
+    "Euronext Lisbon": ".LS",
+    "Singapore Exchange": ".SI",
+    "New Zealand Exchange Ltd": ".NZ",
+    "Tel Aviv Stock Exchange": ".TA",
+}
+
+
+def qualify_ishares_ticker(raw_ticker: Any, exchange: Any) -> str:
+    ticker = clean_text(raw_ticker)
+    exch = clean_text(exchange)
+    if not ticker:
+        return ""
+    suffix = ISHARES_EXCHANGE_SUFFIX.get(exch)
+    if not suffix:
+        return ticker
+    # Do not double-qualify a provider ticker.
+    if "." in ticker:
+        return ticker
+    return ticker + suffix
+
+
+def parse_firsttrust_dom(html_text: str) -> pd.DataFrame:
+    """Parse First Trust's holdings rows even when pandas.read_html misses them."""
+    try:
+        root = lxml_html.fromstring(html_text)
+    except Exception as exc:
+        raise HoldingsError(f"First Trust HTML parse failed: {exc}") from exc
+
+    rows: list[dict[str, Any]] = []
+    for tr in root.xpath("//tr"):
+        cells = [
+            " ".join(clean_text(x) for x in cell.itertext()).strip()
+            for cell in tr.xpath("./th|./td")
+        ]
+        cells = [c for c in cells if c != ""]
+        if len(cells) < 6:
+            continue
+
+        # Expected layout:
+        # Security Name | Identifier | CUSIP | Classification |
+        # Shares / Quantity | Market Value | Weighting
+        weight = to_float(cells[-1])
+        mval = to_float(cells[-2])
+        shares = to_float(cells[-3])
+        if weight is None or mval is None or shares is None:
+            continue
+
+        ticker = clean_text(cells[1])
+        name = clean_text(cells[0])
+        if not ticker or ticker.lower() in {"identifier", "ticker"}:
+            continue
+
+        rows.append(
+            {
+                "raw_ticker": ticker,
+                "raw_name": name,
+                "weight": weight,
+                "shares": shares,
+                "market_value": mval,
+                "isin": "",
+                "sedol": "",
+            }
+        )
+
+    if not rows:
+        raise HoldingsError("no First Trust holdings rows found in DOM")
+
+    return pd.DataFrame(rows, columns=STD_COLS)
+
+
+def parse_downloaded_holdings(
+    response: requests.Response,
+    *,
+    provider: str,
+    source_date_hint: str | None = None,
+) -> tuple[pd.DataFrame, str | None]:
+    """Parse a provider download as CSV or Excel using flexible column names."""
+    ctype = response.headers.get("content-type", "").lower()
+    final_url = str(response.url).lower()
+
+    if (
+        "spreadsheet" in ctype
+        or "excel" in ctype
+        or final_url.endswith((".xls", ".xlsx"))
+        or response.content[:2] == b"PK"
+    ):
+        df, source_date = excel_with_detected_header(
+            response.content,
+            required_tokens=("ticker",),
+        )
+        return df, source_date or source_date_hint
+
+    text = response.text
+    if "ticker" in text[:10000].lower() and "," in text[:2000]:
+        df, _ = sniff_csv(text, ["ticker"])
+        return df, extract_date_from_text(text[:20000]) or source_date_hint
+
+    raise HoldingsError(
+        f"{provider}: download was neither recognizable CSV nor Excel "
+        f"(content-type={ctype}, final_url={response.url})"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -542,18 +769,32 @@ def fetch_ishares(
     _, r = try_urls(session, ISHARES_ACWI_URLS, timeout)
     text = r.text
     df, _ = sniff_csv(text, ["ticker", "name", "weight"])
-    result = standardise(
+
+    ticker_col = pick_col(df, ["ticker"])
+    exchange_col = pick_col(df, ["exchange"])
+    if ticker_col and exchange_col:
+        df = df.copy()
+        df[ticker_col] = [
+            qualify_ishares_ticker(t, ex)
+            for t, ex in zip(df[ticker_col], df[exchange_col])
+        ]
+
+    result_all = standardise(
         df,
-        ticker=pick_col(df, ["ticker"]),
+        ticker=ticker_col,
         name=pick_col(df, ["name"]),
         weight=pick_col(df, ["weight"]),
-        shares=pick_col(df, ["shares"]),
+        shares=pick_col(df, ["quantity", "shares"]),
         mval=pick_col(df, ["market value"]),
         isin=pick_col(df, ["isin"]),
         sedol=pick_col(df, ["sedol"]),
     )
-    result = drop_nonsecurity_rows(result)
-    result, precision = maybe_recompute_from_market_value(result)
+
+    # Recompute before removing cash/FX so the denominator remains the provider's
+    # full portfolio value rather than an equity-only renormalisation.
+    result_all, precision = maybe_recompute_from_market_value(result_all)
+    result = drop_nonsecurity_rows(result_all)
+
     return FetchResult(
         result,
         extract_date_from_text(text[:20000]) or iso_today(),
@@ -564,46 +805,66 @@ def fetch_ishares(
 def fetch_invesco(
     session: requests.Session, etf: str, timeout: int
 ) -> FetchResult:
-    urls = [u.format(t=etf) for u in INVESCO_URLS]
+    """Best-effort official Invesco export.
+
+    Invesco's portfolio table is dynamically loaded and its legacy CSV endpoint
+    currently returns 406 on some hosts. We first visit the official SOXQ page
+    to establish cookies, then retry the export with browser-like download
+    headers. If Invesco still rejects it, the pipeline uses last-known-good.
+    """
+    page = http_get(session, INVESCO_PAGE_URL, timeout)
+    source_date = extract_date_from_text(page.text[:50000]) or iso_today()
+
+    # If Invesco exposes a real downloadable link in the page, prefer it.
+    discovered = find_download_link(
+        page.text,
+        page.url,
+        text_contains=("export",),
+    )
+    candidates = []
+    if discovered:
+        candidates.append(discovered)
+    candidates.extend(u.format(t=etf) for u in INVESCO_URLS)
+
     errors: list[str] = []
-
-    for url in urls:
+    for url in dict.fromkeys(candidates):
         try:
-            r = http_get(session, url, timeout)
-            ctype = r.headers.get("content-type", "").lower()
-            text = r.text
-
-            # Important: Invesco currently may redirect this legacy URL to a
-            # generic HTML ETF page. Do not try to parse that as a holdings CSV.
-            looks_csv = (
-                "csv" in ctype
-                or "," in text.splitlines()[0]
-                or "ticker," in text[:3000].lower()
+            headers = {
+                "Referer": INVESCO_PAGE_URL,
+                "Accept": (
+                    "text/csv,application/csv,application/vnd.ms-excel,"
+                    "application/octet-stream;q=0.9,*/*;q=0.8"
+                ),
+            }
+            r = session.get(
+                url,
+                headers=headers,
+                timeout=(10, timeout),
+                allow_redirects=True,
             )
-            if not looks_csv:
+            if r.status_code != 200 or len(r.content) < 100:
                 raise HoldingsError(
-                    f"{etf}: Invesco export did not return CSV "
-                    f"(final URL: {r.url}, content-type: {ctype})"
+                    f"HTTP {r.status_code}, {len(r.content)} bytes"
                 )
 
-            df, _ = sniff_csv(text, ["ticker", "weight"])
-            result = standardise(
-                df,
-                ticker=pick_col(df, ["holding ticker", "ticker"]),
-                name=pick_col(df, ["name", "security"]),
-                weight=pick_col(df, ["weight"]),
-                shares=pick_col(df, ["shares"]),
-                mval=pick_col(df, ["marketvalue", "market value"]),
-                isin=pick_col(df, ["isin", "security identifier", "identifier"]),
-                sedol=pick_col(df, ["sedol"]),
+            parsed, dl_date = parse_downloaded_holdings(
+                r,
+                provider="Invesco",
+                source_date_hint=source_date,
             )
-            result = drop_nonsecurity_rows(result)
-            result, precision = maybe_recompute_from_market_value(result)
-            return FetchResult(
-                result,
-                extract_date_from_text(text[:20000]) or iso_today(),
-                precision,
+            result_all = standardise(
+                parsed,
+                ticker=pick_col(parsed, ["holding ticker", "ticker", "symbol"]),
+                name=pick_col(parsed, ["name", "security", "holding"]),
+                weight=pick_col(parsed, ["weight", "%"]),
+                shares=pick_col(parsed, ["shares", "quantity"]),
+                mval=pick_col(parsed, ["market value", "marketvalue"]),
+                isin=pick_col(parsed, ["isin", "security identifier"]),
+                sedol=pick_col(parsed, ["sedol"]),
             )
+            result_all, precision = maybe_recompute_from_market_value(result_all)
+            result = drop_nonsecurity_rows(result_all)
+            return FetchResult(result, dl_date or source_date, precision)
         except Exception as exc:
             errors.append(f"{url}: {exc}")
 
@@ -613,146 +874,206 @@ def fetch_invesco(
 def fetch_globalx(
     session: requests.Session, etf: str, timeout: int
 ) -> FetchResult:
-    urls = [u.format(t=etf.lower()) for u in GLOBALX_URLS]
-    _, r = try_urls(session, urls, timeout)
-    text = r.text
-    df, _ = sniff_csv(text, ["ticker", "name"])
-    result = standardise(
-        df,
-        ticker=pick_col(df, ["ticker"]),
-        name=pick_col(df, ["name"]),
-        weight=pick_col(df, ["% of net assets", "net assets", "weight"]),
-        shares=pick_col(df, ["shares held", "shares"]),
-        mval=pick_col(df, ["market value"]),
-        isin=pick_col(df, ["isin"]),
-        sedol=pick_col(df, ["sedol"]),
+    page_url = GLOBALX_PAGE_URL.format(t=etf.upper())
+    page = http_get(session, page_url, timeout)
+    source_date = extract_date_from_text(page.text[:50000]) or iso_today()
+
+    csv_url = find_download_link(
+        page.text,
+        page.url,
+        text_contains=("full holdings",),
+        href_contains=(".csv",),
     )
-    result = drop_nonsecurity_rows(result)
-    result, precision = maybe_recompute_from_market_value(result)
-    return FetchResult(
-        result,
-        extract_date_from_text(text[:20000]) or iso_today(),
-        precision,
+    if not csv_url:
+        # Some page versions have no visible text on the anchor; fall back to
+        # any CSV link that contains the fund ticker or "holding".
+        try:
+            root = lxml_html.fromstring(page.text)
+            links = []
+            for a in root.xpath("//a[@href]"):
+                href = clean_text(a.get("href"))
+                low = href.lower()
+                if ".csv" not in low:
+                    continue
+                score = 0
+                if etf.lower() in low:
+                    score += 3
+                if "holding" in low:
+                    score += 2
+                links.append((score, urljoin(page.url, href)))
+            if links:
+                links.sort(key=lambda x: x[0], reverse=True)
+                csv_url = links[0][1]
+        except Exception:
+            pass
+
+    if not csv_url:
+        raise HoldingsError(f"{etf}: Full Holdings CSV link not found")
+
+    r = http_get(session, csv_url, timeout)
+    parsed, dl_date = parse_downloaded_holdings(
+        r,
+        provider="Global X",
+        source_date_hint=source_date,
     )
+
+    result_all = standardise(
+        parsed,
+        ticker=pick_col(parsed, ["ticker"]),
+        name=pick_col(parsed, ["name"]),
+        weight=pick_col(parsed, ["% of net assets", "net assets", "weight"]),
+        shares=pick_col(parsed, ["shares held", "shares", "quantity"]),
+        mval=pick_col(parsed, ["market value"]),
+        isin=pick_col(parsed, ["isin"]),
+        sedol=pick_col(parsed, ["sedol"]),
+    )
+    result_all, precision = maybe_recompute_from_market_value(result_all)
+    result = drop_nonsecurity_rows(result_all)
+
+    return FetchResult(result, dl_date or source_date, precision)
 
 
 def fetch_firsttrust(
     session: requests.Session, etf: str, timeout: int
 ) -> FetchResult:
     urls = [u.format(t=etf) for u in FIRSTTRUST_URLS]
-    _, r = try_urls(session, urls, timeout)
+    _, page = try_urls(session, urls, timeout)
+    source_date = extract_date_from_text(page.text[:50000]) or iso_today()
 
-    tables = pd.read_html(io.StringIO(r.text))
-    candidates: list[pd.DataFrame] = []
-    for table in tables:
-        cols = " ".join(clean_text(c).lower() for c in table.columns)
-        if (
-            ("%" in cols or "weight" in cols or "percent" in cols)
-            and len(table) > 10
-        ):
-            candidates.append(table)
+    errors: list[str] = []
 
-    if not candidates:
-        raise HoldingsError(f"{etf}: no First Trust holdings table found")
+    # First Trust's holdings are present in the page DOM, but the table markup
+    # is not reliably recognized by pandas.read_html. Parse row cells directly.
+    try:
+        result_all = parse_firsttrust_dom(page.text)
+        result_all, precision = maybe_recompute_from_market_value(result_all)
+        result = drop_nonsecurity_rows(result_all)
+        if len(result) >= MIN_HOLDINGS_BY_TICKER[etf]:
+            return FetchResult(result, source_date, precision)
+        errors.append(f"DOM parser returned only {len(result)} rows")
+    except Exception as exc:
+        errors.append(f"DOM parser: {exc}")
 
-    best = max(candidates, key=len).copy()
-    best.columns = [clean_text(c) for c in best.columns]
-    df = best.astype(str)
-
-    result = standardise(
-        df,
-        ticker=pick_col(df, ["ticker", "symbol"]),
-        name=pick_col(df, ["security", "name", "description"]),
-        weight=pick_col(df, ["% of fund", "percent", "weight", "%"]),
-        shares=pick_col(df, ["shares"]),
-        mval=pick_col(df, ["market value"]),
-        isin=pick_col(df, ["isin"]),
-        sedol=pick_col(df, ["sedol"]),
+    # Secondary path: follow any actual Excel/export link exposed in the page.
+    export_url = (
+        find_download_link(
+            page.text,
+            page.url,
+            text_contains=("export", "excel"),
+        )
+        or find_download_link(
+            page.text,
+            page.url,
+            href_contains=("excel",),
+        )
     )
-    result = drop_nonsecurity_rows(result)
-    result, precision = maybe_recompute_from_market_value(result)
-    return FetchResult(
-        result,
-        extract_date_from_text(r.text[:30000]) or iso_today(),
-        precision,
-    )
+    if export_url:
+        try:
+            r = http_get(session, export_url, timeout)
+            parsed, dl_date = parse_downloaded_holdings(
+                r,
+                provider="First Trust",
+                source_date_hint=source_date,
+            )
+            result_all = standardise(
+                parsed,
+                ticker=pick_col(parsed, ["identifier", "ticker", "symbol"]),
+                name=pick_col(parsed, ["security name", "security", "name"]),
+                weight=pick_col(parsed, ["weighting", "weight", "%"]),
+                shares=pick_col(parsed, ["shares", "quantity"]),
+                mval=pick_col(parsed, ["market value"]),
+                isin=pick_col(parsed, ["isin"]),
+                sedol=pick_col(parsed, ["sedol"]),
+            )
+            result_all, precision = maybe_recompute_from_market_value(result_all)
+            result = drop_nonsecurity_rows(result_all)
+            return FetchResult(result, dl_date or source_date, precision)
+        except Exception as exc:
+            errors.append(f"export parser: {exc}")
+
+    raise HoldingsError(f"{etf}: " + " | ".join(errors))
 
 
 def fetch_vaneck(
     session: requests.Session, etf: str, timeout: int
 ) -> FetchResult:
+    page = http_get(session, VANECK_PAGE_URL, timeout)
+    source_date = extract_date_from_text(page.text[:50000]) or iso_today()
     errors: list[str] = []
 
-    for url in VANECK_URLS:
+    # VanEck's official page exposes a "Download XLS" control. Resolve that link
+    # dynamically so future filename/date changes do not require code edits.
+    xls_url = (
+        find_download_link(
+            page.text,
+            page.url,
+            text_contains=("download", "xls"),
+        )
+        or find_download_link(
+            page.text,
+            page.url,
+            href_contains=(".xls",),
+        )
+    )
+    if xls_url:
         try:
-            r = http_get(session, url, timeout)
-            ctype = r.headers.get("content-type", "").lower()
-
-            # First try CSV when the response looks CSV-ish.
-            if (
-                "csv" in ctype
-                or "format=csv" in url
-                or "ticker," in r.text[:3000].lower()
-            ):
-                try:
-                    df, _ = sniff_csv(r.text, ["ticker", "weight"])
-                    result = standardise(
-                        df,
-                        ticker=pick_col(df, ["ticker"]),
-                        name=pick_col(df, ["name", "holding", "security"]),
-                        weight=pick_col(df, ["weight", "% of net"]),
-                        shares=pick_col(df, ["shares"]),
-                        mval=pick_col(df, ["market value"]),
-                        isin=pick_col(df, ["isin"]),
-                        sedol=pick_col(df, ["sedol"]),
-                    )
-                    result = drop_nonsecurity_rows(result)
-                    result, precision = maybe_recompute_from_market_value(result)
-                    return FetchResult(
-                        result,
-                        extract_date_from_text(r.text[:20000]) or iso_today(),
-                        precision,
-                    )
-                except Exception as exc:
-                    errors.append(f"CSV parse {url}: {exc}")
-
-            # HTML fallback.
-            tables = pd.read_html(io.StringIO(r.text))
-            candidates = [
-                t for t in tables
-                if any(
-                    "weight" in clean_text(c).lower()
-                    or "%" in clean_text(c)
-                    for c in t.columns
-                )
-            ]
-            if not candidates:
-                raise HoldingsError("no holdings HTML table")
-            best = max(candidates, key=len).copy()
-            best.columns = [clean_text(c) for c in best.columns]
-            df = best.astype(str)
-
-            result = standardise(
-                df,
-                ticker=pick_col(df, ["ticker", "symbol"]),
-                name=pick_col(df, ["name", "holding", "security"]),
-                weight=pick_col(df, ["weight", "%"]),
-                shares=pick_col(df, ["shares"]),
-                mval=pick_col(df, ["market value"]),
-                isin=pick_col(df, ["isin"]),
-                sedol=pick_col(df, ["sedol"]),
+            r = http_get(session, xls_url, timeout)
+            parsed, dl_date = parse_downloaded_holdings(
+                r,
+                provider="VanEck",
+                source_date_hint=source_date,
             )
-            result = drop_nonsecurity_rows(result)
-            result, precision = maybe_recompute_from_market_value(result)
-            return FetchResult(
-                result,
-                extract_date_from_text(r.text[:30000]) or iso_today(),
-                precision,
+            result_all = standardise(
+                parsed,
+                ticker=pick_col(parsed, ["ticker", "symbol"]),
+                name=pick_col(parsed, ["holding name", "name", "holding", "security"]),
+                weight=pick_col(parsed, ["% of net assets", "% of net", "weight"]),
+                shares=pick_col(parsed, ["shares", "quantity"]),
+                mval=pick_col(parsed, ["market value"]),
+                isin=pick_col(parsed, ["isin"]),
+                sedol=pick_col(parsed, ["sedol"]),
             )
+            result_all, precision = maybe_recompute_from_market_value(result_all)
+            result = drop_nonsecurity_rows(result_all)
+            return FetchResult(result, dl_date or source_date, precision)
         except Exception as exc:
-            errors.append(f"{url}: {exc}")
+            errors.append(f"XLS parser: {exc}")
 
-    raise HoldingsError(" | ".join(errors))
+    # HTML fallback for page versions where the link is generated client-side.
+    try:
+        tables = pd.read_html(io.StringIO(page.text))
+        candidates = [
+            t for t in tables
+            if len(t) >= 20
+            and any(
+                "weight" in clean_text(c).lower()
+                or "% of net" in clean_text(c).lower()
+                for c in t.columns
+            )
+        ]
+        if not candidates:
+            raise HoldingsError("no holdings table")
+        best = max(candidates, key=len).copy()
+        best.columns = [clean_text(c) for c in best.columns]
+        parsed = best.astype(str)
+
+        result_all = standardise(
+            parsed,
+            ticker=pick_col(parsed, ["ticker", "symbol"]),
+            name=pick_col(parsed, ["holding name", "name", "holding", "security"]),
+            weight=pick_col(parsed, ["% of net assets", "% of net", "weight", "%"]),
+            shares=pick_col(parsed, ["shares", "quantity"]),
+            mval=pick_col(parsed, ["market value"]),
+            isin=pick_col(parsed, ["isin"]),
+            sedol=pick_col(parsed, ["sedol"]),
+        )
+        result_all, precision = maybe_recompute_from_market_value(result_all)
+        result = drop_nonsecurity_rows(result_all)
+        return FetchResult(result, source_date, precision)
+    except Exception as exc:
+        errors.append(f"HTML parser: {exc}")
+
+    raise HoldingsError(f"{etf}: " + " | ".join(errors))
 
 
 def _walk_dict_lists(value: Any):
@@ -927,7 +1248,6 @@ def drift_vgt_with_yahoo(
             interval="1d",
             actions=True,
             auto_adjust=False,
-            repair=True,
             keepna=False,
             progress=False,
             threads=True,
