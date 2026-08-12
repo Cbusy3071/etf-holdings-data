@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
 
   schedule:
-  - cron: "7 7 * * 2-6"
-    timezone: "Australia/Sydney"
+    - cron: "7 7 * * 2-6"
+      timezone: "Australia/Sydney"
 
 permissions:
   contents: write
@@ -26,10 +26,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-         
 
       - name: Install dependencies
-        run: pip install pandas requests
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests yfinance openpyxl lxml html5lib
+
+      - name: Check Python syntax
+        run: python -m py_compile update_holdings.py
 
       - name: Create output directory
         run: mkdir -p data
@@ -38,13 +42,58 @@ jobs:
         run: |
           python update_holdings.py \
             --out-dir data \
-            --no-per-fund \
             --combined-name ETF_Holdings_Latest.csv \
             VGT ACWI XLF XLI XLC PPH MLPX GRID SOXQ
 
-      - name: Confirm output exists
+      - name: Validate generated output
         run: |
           test -s data/ETF_Holdings_Latest.csv
+
+          python - <<'PY'
+          import pandas as pd
+
+          path = "data/ETF_Holdings_Latest.csv"
+          df = pd.read_csv(path)
+
+          expected_columns = [
+              "source_date",
+              "retrieved_at_utc",
+              "fund_ticker",
+              "provider",
+              "rank",
+              "holding_ticker",
+              "holding_name",
+              "weight",
+              "shares_held",
+              "market_value_usd",
+          ]
+
+          expected_funds = {
+              "VGT", "ACWI", "XLF", "XLI", "XLC",
+              "PPH", "MLPX", "GRID", "SOXQ"
+          }
+
+          if list(df.columns) != expected_columns:
+              raise SystemExit(
+                  f"Unexpected CSV columns: {list(df.columns)}"
+              )
+
+          actual_funds = set(df["fund_ticker"].dropna().unique())
+
+          if actual_funds != expected_funds:
+              raise SystemExit(
+                  f"ETF mismatch. Expected {expected_funds}, got {actual_funds}"
+              )
+
+          print(f"Validated {len(df):,} rows across {len(actual_funds)} ETFs")
+
+          for ticker, group in df.groupby("fund_ticker"):
+              print(
+                  ticker,
+                  len(group),
+                  f"weight={group['weight'].sum():.8f}%"
+              )
+          PY
 
       - name: Commit updated CSV
         run: |
@@ -54,32 +103,30 @@ jobs:
           # Preserve the newly generated CSV outside the repository.
           cp data/ETF_Holdings_Latest.csv /tmp/ETF_Holdings_Latest.csv
 
-          # Retry if main changes between fetching and pushing.
-          for attempt in 1 2 3; do
-            echo "Push attempt ${attempt}"
+          # Fetch the current main branch.
+          git fetch origin main
 
-            git fetch origin main
-            git reset --hard origin/main
+          # Critical safety check:
+          # do not allow a workflow started from old code to publish a CSV
+          # after update_holdings.py has changed on main.
+          if [ "$(git rev-parse origin/main)" != "$GITHUB_SHA" ]; then
+            echo "Main changed while this workflow was running."
+            echo "Refusing to publish output generated from stale code."
+            exit 1
+          fi
 
-            mkdir -p data
-            cp /tmp/ETF_Holdings_Latest.csv data/ETF_Holdings_Latest.csv
-            git add data/ETF_Holdings_Latest.csv
+          git reset --hard origin/main
 
-            if git diff --cached --quiet; then
-              echo "No holdings changes detected."
-              exit 0
-            fi
+          mkdir -p data
+          cp /tmp/ETF_Holdings_Latest.csv data/ETF_Holdings_Latest.csv
+          git add data/ETF_Holdings_Latest.csv
 
-            git commit -m "Update ETF holdings $(date -u +'%Y-%m-%d %H:%M UTC')"
+          if git diff --cached --quiet; then
+            echo "No holdings changes detected."
+            exit 0
+          fi
 
-            if git push origin HEAD:main; then
-              echo "Holdings CSV successfully published."
-              exit 0
-            fi
+          git commit -m "Update ETF holdings $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push origin HEAD:main
 
-            echo "Remote branch changed before push. Retrying..."
-            sleep 3
-          done
-
-          echo "Failed to publish after three attempts."
-          exit 1
+          echo "Holdings CSV successfully published."
