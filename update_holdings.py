@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 """
-GitHub-Actions-friendly ETF holdings puller using Perplexity Finance's
-undocumented holdings endpoint.
+GitHub-Actions-friendly ETF holdings puller.
 
-The script downloads holdings for every requested US-listed ETF, normalises
-them into one stable CSV schema, validates that every requested fund succeeded,
-and only then atomically replaces the live output file. This prevents a failed
-or partial weekly run from silently replacing a valid CSV used by Excel.
+Source order for every requested US-listed ETF:
+    1. Zacks holdings page (primary)
+    2. Perplexity Finance undocumented holdings endpoint (fallback)
+
+The script normalises holdings into one stable CSV schema, validates that every
+requested fund succeeded from at least one source, and only then atomically
+replaces the live output file. This prevents a failed or partial weekly run from
+silently replacing a valid CSV used by Excel.
 
 Default output:
     data/ETF_Holdings_Latest.csv
 
 Examples:
-    python scrape_etf_holdings_updated.py VGT ACWI XLF
+    python scrape_etf_holdings_zacks_primary.py VGT ACWI XLF
 
-    python scrape_etf_holdings_updated.py \
+    python scrape_etf_holdings_zacks_primary.py \
         --no-per-fund \
         VGT ACWI XLF XLI XLC PPH MLPX GRID SOXQ
 
-    python scrape_etf_holdings_updated.py \
+    python scrape_etf_holdings_zacks_primary.py \
         --out-dir data \
         --combined-name ETF_Holdings_Latest.csv \
         --no-per-fund \
@@ -28,18 +31,31 @@ Requires:
     pip install requests pandas
 
 Important:
-    This relies on an undocumented endpoint behind Perplexity's finance UI:
+    Zacks primary URL pattern:
+        https://www.zacks.com/funds/etf/<TICKER>/holding
+
+    Zacks embeds its holdings table data in the page source as the JavaScript
+    variable ``etf_holdings.formatted_data``. The parser extracts that JSON
+    payload without needing a browser or BeautifulSoup.
+
+    Perplexity fallback endpoint:
         https://www.perplexity.ai/rest/finance/holdings/<TICKER>
 
-    It is not a published or guaranteed API and may change or be disabled.
-    The source_date field is the date this script retrieved the data; it is
-    not represented as the issuer's official holdings effective date.
+    The Perplexity endpoint is undocumented and may change or be disabled.
+    Zacks may also change its HTML/JavaScript structure or block automated
+    requests. If Zacks cannot be fetched or parsed for a ticker, the script
+    automatically attempts Perplexity for that ticker.
+
+    The source_date field is the date this script retrieved the data; it is not
+    represented as the issuer's official holdings effective date.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,6 +77,22 @@ USER_AGENT = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
+ZACKS_URL = "https://www.zacks.com/funds/etf/{ticker}/holding"
+PERPLEXITY_URL = "https://www.perplexity.ai/rest/finance/holdings/{ticker}"
+
+# Zacks stores the displayed holdings as a JSON-compatible JavaScript array.
+# DOTALL makes this tolerant of the array being written across multiple lines.
+ZACKS_HOLDINGS_RE = re.compile(
+    r"etf_holdings\.formatted_data\s*=\s*(\[.*?\])\s*;",
+    flags=re.DOTALL,
+)
+
+# Symbol links inside the Zacks payload have historically included both
+# /funds/etf/<SYMBOL> and a rel="<SYMBOL>" attribute. Support both forms.
+ZACKS_ETF_SYMBOL_RE = re.compile(r"/funds/etf/([^\"'/?<>&\\]+)", flags=re.IGNORECASE)
+ZACKS_REL_SYMBOL_RE = re.compile(r"\brel=[\"']([^\"']+)[\"']", flags=re.IGNORECASE)
+
+
 # Cosmetic only. Add or change entries without affecting the fetch logic.
 PROVIDERS = {
     "VGT": "Vanguard",
@@ -74,9 +106,10 @@ PROVIDERS = {
     "SOXQ": "Invesco",
 }
 
-# The first five fields retain compatibility with the Power Query schema
-# previously proposed for the Excel workbook. Extra fields remain available
-# for audit and analysis.
+
+# Keep this schema unchanged so existing Excel / Power Query steps continue to
+# work. Source choice is reported in the GitHub Actions log rather than adding a
+# new CSV column.
 UNIFIED_COLS = [
     "source_date",
     "retrieved_at_utc",
@@ -113,7 +146,9 @@ def build_session() -> requests.Session:
     session.headers.update(
         {
             "User-Agent": USER_AGENT,
-            "Accept": "application/json, text/plain, */*",
+            "Accept": "text/html,application/xhtml+xml,application/json,text/plain,*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
         }
     )
     session.mount("https://", adapter)
@@ -121,13 +156,144 @@ def build_session() -> requests.Session:
     return session
 
 
-def extract_holdings_payload(payload: Any, ticker: str) -> list[dict[str, Any]]:
-    """Return a list of holdings from the currently observed API payload.
+def numeric_series(values: pd.Series) -> pd.Series:
+    """Convert display-formatted numeric values such as '1,234' or '4.5%' to numbers."""
+    cleaned = (
+        values.astype("string")
+        .str.replace(",", "", regex=False)
+        .str.replace("%", "", regex=False)
+        .str.replace("$", "", regex=False)
+        .str.strip()
+        .replace({"": pd.NA, "-": pd.NA, "--": pd.NA, "N/A": pd.NA, "NA": pd.NA})
+    )
+    return pd.to_numeric(cleaned, errors="coerce")
 
-    The endpoint currently returns a bare list. A small number of common
-    wrapper keys are also supported so a minor response-format change does not
-    immediately break the pipeline.
-    """
+
+def extract_zacks_symbol(symbol_html: Any) -> str:
+    """Extract a holding ticker from the HTML fragment embedded by Zacks."""
+    text = "" if symbol_html is None else str(symbol_html)
+
+    match = ZACKS_ETF_SYMBOL_RE.search(text)
+    if match:
+        return match.group(1).strip().upper()
+
+    match = ZACKS_REL_SYMBOL_RE.search(text)
+    if match:
+        candidate = match.group(1).strip().upper()
+        # Avoid accidentally treating descriptive rel values as symbols.
+        if candidate and " " not in candidate and len(candidate) <= 20:
+            return candidate
+
+    # Some payload variants may eventually expose a plain symbol rather than an
+    # HTML fragment. Accept a conservative ticker-like token as a final option.
+    plain = text.strip().upper()
+    if re.fullmatch(r"[A-Z0-9.\-]{1,20}", plain):
+        return plain
+
+    return ""
+
+
+def extract_zacks_rows(page_text: str, ticker: str) -> list[list[Any]]:
+    """Extract the JSON rows stored in Zacks' etf_holdings.formatted_data variable."""
+    match = ZACKS_HOLDINGS_RE.search(page_text)
+    if not match:
+        preview = re.sub(r"\s+", " ", page_text[:250]).strip()
+        raise HoldingsError(
+            f"Zacks holdings payload not found for {ticker}. "
+            f"Page preview: {preview!r}"
+        )
+
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError as exc:
+        raise HoldingsError(f"Could not parse Zacks holdings JSON for {ticker}: {exc}") from exc
+
+    if not isinstance(payload, list) or not payload:
+        raise HoldingsError(f"No holdings returned by Zacks for {ticker}")
+
+    rows = [row for row in payload if isinstance(row, list)]
+    if not rows:
+        raise HoldingsError(f"Malformed Zacks holdings rows returned for {ticker}")
+
+    return rows
+
+
+def fetch_zacks(
+    session: requests.Session,
+    ticker: str,
+    timeout_seconds: int,
+) -> pd.DataFrame:
+    """Fetch and standardise holdings from the Zacks ETF holdings page."""
+    ticker = ticker.strip().upper()
+    url = ZACKS_URL.format(ticker=ticker)
+
+    response = session.get(
+        url,
+        timeout=(10, timeout_seconds),
+        headers={"Referer": f"https://www.zacks.com/funds/etf/{ticker}"},
+    )
+    response.raise_for_status()
+
+    # A 200 response can still be an anti-bot/challenge page. Requiring the
+    # holdings variable below makes that fail cleanly into the fallback path.
+    rows = extract_zacks_rows(response.text, ticker)
+
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        # Historically:
+        #   [0] company name
+        #   [1] symbol HTML
+        #   [2] shares held
+        #   [3] weight (%)
+        #   [4] 52-week % change
+        #   [5] report link
+        if len(row) < 4:
+            continue
+
+        holding_ticker = extract_zacks_symbol(row[1])
+        holding_name = "" if row[0] is None else str(row[0]).strip()
+        shares_held = row[2]
+        weight = row[3]
+
+        # Zacks sometimes contains non-security rows. A usable portfolio row
+        # must have at least a symbol and a weight.
+        if not holding_ticker:
+            continue
+
+        records.append(
+            {
+                "holding_ticker": holding_ticker,
+                "holding_name": holding_name,
+                "weight": weight,
+                "shares_held": shares_held,
+                # Zacks' displayed holdings array does not provide market value.
+                "market_value_usd": pd.NA,
+            }
+        )
+
+    if not records:
+        raise HoldingsError(f"No usable Zacks holding rows parsed for {ticker}")
+
+    frame = pd.DataFrame.from_records(records)
+    frame["weight"] = numeric_series(frame["weight"])
+    frame["shares_held"] = numeric_series(frame["shares_held"])
+
+    if frame["weight"].notna().sum() == 0:
+        raise HoldingsError(f"No numeric holding weights returned by Zacks for {ticker}")
+
+    frame["holding_ticker"] = frame["holding_ticker"].fillna("").astype(str).str.strip()
+    frame["holding_name"] = frame["holding_name"].fillna("").astype(str).str.strip()
+
+    # Drop duplicate symbols defensively. If Zacks ever repeats a symbol, keep
+    # the first/highest weight row rather than double-counting the exposure.
+    frame = frame.sort_values("weight", ascending=False, na_position="last")
+    frame = frame.drop_duplicates(subset=["holding_ticker"], keep="first")
+    frame = frame.reset_index(drop=True)
+    return frame
+
+
+def extract_holdings_payload(payload: Any, ticker: str) -> list[dict[str, Any]]:
+    """Return a list of holdings from the currently observed Perplexity payload."""
     if isinstance(payload, list):
         records = payload
     elif isinstance(payload, dict):
@@ -139,20 +305,20 @@ def extract_holdings_payload(payload: Any, ticker: str) -> list[dict[str, Any]]:
                 break
         if records is None:
             raise HoldingsError(
-                f"Unexpected JSON structure returned for {ticker}; "
+                f"Unexpected JSON structure returned by Perplexity for {ticker}; "
                 f"top-level keys: {sorted(payload.keys())[:10]}"
             )
     else:
         raise HoldingsError(
-            f"Unexpected JSON type returned for {ticker}: "
+            f"Unexpected JSON type returned by Perplexity for {ticker}: "
             f"{type(payload).__name__}"
         )
 
     if not records:
-        raise HoldingsError(f"No holdings returned for {ticker}")
+        raise HoldingsError(f"No holdings returned by Perplexity for {ticker}")
 
     if not all(isinstance(item, dict) for item in records):
-        raise HoldingsError(f"Malformed holdings records returned for {ticker}")
+        raise HoldingsError(f"Malformed Perplexity holdings records returned for {ticker}")
 
     return records
 
@@ -162,11 +328,15 @@ def fetch_perplexity(
     ticker: str,
     timeout_seconds: int,
 ) -> pd.DataFrame:
-    """Fetch and minimally standardise a fund's holdings response."""
+    """Fetch and minimally standardise a fund's Perplexity holdings response."""
     ticker = ticker.strip().upper()
-    url = f"https://www.perplexity.ai/rest/finance/holdings/{ticker}"
+    url = PERPLEXITY_URL.format(ticker=ticker)
 
-    response = session.get(url, timeout=(10, timeout_seconds))
+    response = session.get(
+        url,
+        timeout=(10, timeout_seconds),
+        headers={"Accept": "application/json, text/plain, */*"},
+    )
     response.raise_for_status()
 
     try:
@@ -174,7 +344,7 @@ def fetch_perplexity(
     except ValueError as exc:
         preview = response.text[:200].replace("\n", " ")
         raise HoldingsError(
-            f"Non-JSON response returned for {ticker}: {preview!r}"
+            f"Non-JSON response returned by Perplexity for {ticker}: {preview!r}"
         ) from exc
 
     records = extract_holdings_payload(payload, ticker)
@@ -195,7 +365,7 @@ def fetch_perplexity(
     )
 
     if "weight" not in frame.columns:
-        raise HoldingsError(f"Required 'weight' field missing for {ticker}")
+        raise HoldingsError(f"Required 'weight' field missing from Perplexity for {ticker}")
 
     for column in ("holding_ticker", "holding_name", "shares_held", "market_value_usd"):
         if column not in frame.columns:
@@ -208,7 +378,7 @@ def fetch_perplexity(
     )
 
     if frame["weight"].notna().sum() == 0:
-        raise HoldingsError(f"No numeric holding weights returned for {ticker}")
+        raise HoldingsError(f"No numeric holding weights returned by Perplexity for {ticker}")
 
     frame["holding_ticker"] = frame["holding_ticker"].fillna("").astype(str).str.strip()
     frame["holding_name"] = frame["holding_name"].fillna("").astype(str).str.strip()
@@ -271,6 +441,34 @@ def validate_normalized(
 
     if frame["weight"].notna().sum() == 0:
         raise HoldingsError(f"No numeric weights survived normalisation for {ticker}")
+
+
+def fetch_with_fallback(
+    session: requests.Session,
+    ticker: str,
+    timeout_seconds: int,
+    retrieved_at: datetime,
+    min_rows: int,
+) -> tuple[pd.DataFrame, str]:
+    """Try Zacks first, then Perplexity if Zacks fails validation for this ticker."""
+    attempts = (
+        ("Zacks", fetch_zacks),
+        ("Perplexity", fetch_perplexity),
+    )
+    errors: list[str] = []
+
+    for source_name, fetcher in attempts:
+        print(f"[{ticker}] Trying {source_name}...", file=sys.stderr)
+        try:
+            raw = fetcher(session, ticker, timeout_seconds)
+            normalised = normalize(raw, ticker, retrieved_at)
+            validate_normalized(normalised, ticker, min_rows)
+            return normalised, source_name
+        except Exception as exc:
+            errors.append(f"{source_name}: {exc}")
+            print(f"[{ticker}] {source_name} failed: {exc}", file=sys.stderr)
+
+    raise HoldingsError(" | ".join(errors))
 
 
 def write_csv_atomic(frame: pd.DataFrame, destination: Path) -> None:
@@ -377,26 +575,32 @@ def main() -> int:
 
     retrieved_at = datetime.now(timezone.utc)
     successful: dict[str, pd.DataFrame] = {}
+    sources_used: dict[str, str] = {}
     failures: dict[str, str] = {}
 
     with build_session() as session:
         for ticker in tickers:
-            print(f"[{ticker}] Fetching holdings...", file=sys.stderr)
+            print(f"[{ticker}] Fetching holdings (Zacks -> Perplexity)...", file=sys.stderr)
             try:
-                raw = fetch_perplexity(session, ticker, args.timeout)
-                normalised = normalize(raw, ticker, retrieved_at)
-                validate_normalized(normalised, ticker, args.min_rows)
+                normalised, source_name = fetch_with_fallback(
+                    session=session,
+                    ticker=ticker,
+                    timeout_seconds=args.timeout,
+                    retrieved_at=retrieved_at,
+                    min_rows=args.min_rows,
+                )
                 successful[ticker] = normalised
+                sources_used[ticker] = source_name
 
                 top_weight = normalised["weight"].dropna().iloc[0]
                 print(
-                    f"[{ticker}] OK: {len(normalised)} rows "
+                    f"[{ticker}] OK via {source_name}: {len(normalised)} rows "
                     f"(top holding weight {top_weight:.4g})",
                     file=sys.stderr,
                 )
             except Exception as exc:  # one failed ticker is reported with context
                 failures[ticker] = str(exc)
-                print(f"[{ticker}] FAILED: {exc}", file=sys.stderr)
+                print(f"[{ticker}] FAILED from all sources: {exc}", file=sys.stderr)
 
     if failures and not args.allow_partial:
         print("\nUpdate aborted. Existing CSV was not replaced.", file=sys.stderr)
@@ -445,6 +649,10 @@ def main() -> int:
         f"-> {combined_path}",
         file=sys.stderr,
     )
+    print("Sources used:", file=sys.stderr)
+    for ticker in tickers:
+        if ticker in sources_used:
+            print(f"  - {ticker}: {sources_used[ticker]}", file=sys.stderr)
 
     if failures:
         print(
