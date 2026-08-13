@@ -1,57 +1,49 @@
 #!/usr/bin/env python3
 """
-Provider-first ETF holdings pipeline for the Eight Bays model.
+Provider-first ETF holdings pipeline.
 
 Primary sources:
-  VGT   Vanguard snapshot + live Yahoo prices to drift weights between snapshots
+  VGT   Vanguard snapshot + Yahoo prices
   ACWI  iShares daily holdings CSV
   XLF   State Street daily holdings XLSX
   XLI   State Street daily holdings XLSX
   XLC   State Street daily holdings XLSX
-  PPH   VanEck holdings CSV/HTML
-  MLPX  Global X holdings CSV
-  GRID  First Trust holdings HTML
-  SOXQ  Invesco holdings export (fails safely if the export endpoint changes)
+  PPH   VanEck official holdings XLSX
+  MLPX  Global X official holdings CSV
+  GRID  First Trust official holdings page
+  SOXQ  Invesco official export, with safe last-known-good fallback
 
 Output:
   data/ETF_Holdings_Latest.csv
 
-The output schema is intentionally identical to the existing Power Query feed:
-  source_date,retrieved_at_utc,fund_ticker,provider,rank,
-  holding_ticker,holding_name,weight,shares_held,market_value_usd
-
-Design principles:
-  * Issuer/provider data is always the first-line source.
-  * If complete market values are available, weights are recomputed from market
-    values instead of using rounded website percentages.
-  * VGT uses Vanguard's exact shares snapshot and live Yahoo prices. Stock splits
-    after the Vanguard snapshot are incorporated before current market values are
-    calculated.
-  * Security identity is resolved internally as:
-        ISIN -> SEDOL -> unambiguous ticker -> normalized name
-    and the same canonical ticker/name is used across ETFs.
-  * A truncated or malformed live response is NEVER allowed to replace a valid
-    prior snapshot.
-  * If a live provider fails, the previous valid rows for that ETF are reused
-    with their original source_date/retrieved_at_utc preserved.
-  * The combined CSV is only replaced when every requested ETF has either a
-    newly validated provider pull or valid last-known-good rows.
+Exact output schema:
+  source_date
+  retrieved_at_utc
+  fund_ticker
+  provider
+  rank
+  holding_ticker
+  holding_name
+  weight
+  shares_held
+  market_value_usd
 
 Dependencies:
-  pip install requests pandas yfinance openpyxl lxml html5lib
+  pip install pandas requests yfinance openpyxl lxml html5lib
 """
 
 from __future__ import annotations
 
 import argparse
+import html as html_lib
 import io
 import json
 import math
 import os
 import re
 import sys
-import time
 import unicodedata
+
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -60,65 +52,31 @@ from urllib.parse import urljoin
 
 import pandas as pd
 import requests
+
 from lxml import html as lxml_html
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ---------------------------------------------------------------------------
+
+# ============================================================
 # CONFIG
-# ---------------------------------------------------------------------------
+# ============================================================
 
 DEFAULT_OUT_DIR = Path("data")
 DEFAULT_COMBINED_NAME = "ETF_Holdings_Latest.csv"
 DEFAULT_TIMEOUT_SECONDS = 30
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/126.0.0.0 Safari/537.36"
-    ),
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Cache-Control": "no-cache",
-}
-
-PROVIDER_LABELS = {
-    "VGT": "Vanguard",
-    "ACWI": "iShares",
-    "XLF": "SPDR/State Street",
-    "XLI": "SPDR/State Street",
-    "XLC": "SPDR/State Street",
-    "PPH": "VanEck",
-    "MLPX": "Global X",
-    "GRID": "First Trust",
-    "SOXQ": "Invesco",
-}
-
-# Hard floors protect against top-10/top-20/top-100 pages replacing full funds.
-MIN_HOLDINGS_BY_TICKER = {
-    "VGT": 250,
-    "ACWI": 1500,
-    "XLF": 60,
-    "XLI": 60,
-    "XLC": 20,
-    "PPH": 20,
-    "MLPX": 20,
-    "GRID": 80,
-    "SOXQ": 25,
-}
-
-# A new provider pull must retain at least this fraction of the previous valid
-# number of rows. 90% is deliberately stricter than the old 85% guard.
-MIN_PREVIOUS_COUNT_RATIO = 0.90
-
-# ETF weights can differ slightly from 100 because of cash/rounding/derivatives.
-MIN_TOTAL_WEIGHT = 98.0
-MAX_TOTAL_WEIGHT = 102.0
-
-# For VGT, tiny unpriced tails may use Vanguard's snapshot market value.
-# Anything larger makes the run fail instead of silently treating a holding as 0.
-VGT_MAX_TOTAL_FALLBACK_WEIGHT_PCT = 0.05  # 5 bps
+DEFAULT_ETFS = [
+    "VGT",
+    "ACWI",
+    "XLF",
+    "XLI",
+    "XLC",
+    "PPH",
+    "MLPX",
+    "GRID",
+    "SOXQ",
+]
 
 OUTPUT_COLS = [
     "source_date",
@@ -143,57 +101,106 @@ STD_COLS = [
     "sedol",
 ]
 
-SSGA_URL = (
-    "https://www.ssga.com/us/en/intermediary/etfs/library-content/"
-    "products/fund-data/etfs/us/holdings-daily-us-en-{t}.xlsx"
-)
+PROVIDER_LABELS = {
+    "VGT": "Vanguard",
+    "ACWI": "iShares",
+    "XLF": "SPDR/State Street",
+    "XLI": "SPDR/State Street",
+    "XLC": "SPDR/State Street",
+    "PPH": "VanEck",
+    "MLPX": "Global X",
+    "GRID": "First Trust",
+    "SOXQ": "Invesco",
+}
 
-ISHARES_ACWI_URLS = [
-    # Current official iShares download linked from the ACWI fund page.
-    "https://www.ishares.com/us/products/239600/ishares-msci-acwi-etf/latest-holdings.csv",
-]
+MIN_HOLDINGS_BY_TICKER = {
+    "VGT": 250,
+    "ACWI": 1500,
+    "XLF": 60,
+    "XLI": 60,
+    "XLC": 20,
+    "PPH": 20,
+    "MLPX": 20,
+    "GRID": 80,
+    "SOXQ": 25,
+}
 
-INVESCO_PAGE_URL = (
-    "https://www.invesco.com/us/en/financial-products/etfs/"
-    "invesco-phlx-semiconductor-etf.html"
-)
+MIN_PREVIOUS_COUNT_RATIO = 0.90
 
-# Legacy official export route is retained as a best-effort attempt after first
-# visiting the product page to establish cookies. If Invesco changes it again,
-# the run falls back to last-known-good rather than publishing a partial table.
-INVESCO_URLS = [
-    (
-        "https://www.invesco.com/us/financial-products/etfs/holdings/main/"
-        "holdings/0?audienceType=Investor&action=download&ticker={t}"
+MIN_TOTAL_WEIGHT = 98.0
+MAX_TOTAL_WEIGHT = 102.0
+
+VGT_MAX_TOTAL_FALLBACK_WEIGHT_PCT = 0.05
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0.0.0 Safari/537.36"
     ),
-]
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+}
 
-GLOBALX_PAGE_URL = "https://www.globalxetfs.com/funds/{t}"
 
-FIRSTTRUST_URLS = [
-    "https://www.ftportfolios.com/Retail/Etf/EtfHoldings.aspx?Ticker={t}",
-]
+# ============================================================
+# PROVIDER URLS
+# ============================================================
+
+SSGA_URL = (
+    "https://www.ssga.com/us/en/intermediary/etfs/"
+    "library-content/products/fund-data/etfs/us/"
+    "holdings-daily-us-en-{ticker}.xlsx"
+)
+
+ISHARES_ACWI_URL = (
+    "https://www.ishares.com/us/products/239600/"
+    "ishares-msci-acwi-etf/latest-holdings.csv"
+)
 
 VANECK_PAGE_URL = (
     "https://www.vaneck.com/us/en/investments/"
     "pharmaceutical-etf-pph/holdings/"
 )
 
-VANGUARD_URLS = [
-    "https://investor.vanguard.com/investment-products/etfs/profile/api/"
-    "{t}/portfolio-holding/stock",
-]
+VANECK_HOLDINGS_XLSX_URL = (
+    "https://www.vaneck.com/us/en/investments/"
+    "pharmaceutical-etf-pph/downloads/holdings/"
+)
 
-# Canonical display-name overrides can be keyed by identity, ticker or normalized
-# name. Leave empty unless a provider gives a particularly ugly label.
-CANONICAL_NAME_OVERRIDES: dict[str, str] = {
-    # "TK:MSFT": "Microsoft Corporation",
-    # "ISIN:US5949181045": "Microsoft Corporation",
-}
+GLOBALX_PAGE_URL = (
+    "https://www.globalxetfs.com/funds/{ticker}"
+)
 
-# ---------------------------------------------------------------------------
-# TYPES / ERRORS
-# ---------------------------------------------------------------------------
+FIRSTTRUST_URL = (
+    "https://www.ftportfolios.com/Retail/Etf/"
+    "EtfHoldings.aspx?Ticker={ticker}"
+)
+
+INVESCO_PAGE_URL = (
+    "https://www.invesco.com/us/en/financial-products/"
+    "etfs/invesco-phlx-semiconductor-etf.html"
+)
+
+INVESCO_EXPORT_URL = (
+    "https://www.invesco.com/us/financial-products/"
+    "etfs/holdings/main/holdings/0"
+    "?audienceType=Investor"
+    "&action=download"
+    "&ticker={ticker}"
+)
+
+VANGUARD_URL = (
+    "https://investor.vanguard.com/"
+    "investment-products/etfs/profile/api/"
+    "{ticker}/portfolio-holding/stock"
+)
+
+
+# ============================================================
+# ERRORS / TYPES
+# ============================================================
 
 class HoldingsError(RuntimeError):
     pass
@@ -206,9 +213,21 @@ class FetchResult:
     precision_method: str
 
 
-# ---------------------------------------------------------------------------
+# ============================================================
+# TIME
+# ============================================================
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def iso_today() -> str:
+    return utc_now().date().isoformat()
+
+
+# ============================================================
 # HTTP
-# ---------------------------------------------------------------------------
+# ============================================================
 
 def build_session() -> requests.Session:
     retry = Retry(
@@ -221,198 +240,358 @@ def build_session() -> requests.Session:
         allowed_methods=frozenset({"GET"}),
         raise_on_status=False,
     )
+
     adapter = HTTPAdapter(max_retries=retry)
+
     session = requests.Session()
     session.headers.update(HEADERS)
+
     session.mount("https://", adapter)
     session.mount("http://", adapter)
+
     return session
 
 
-def http_get(session: requests.Session, url: str, timeout: int) -> requests.Response:
-    r = session.get(url, timeout=(10, timeout), allow_redirects=True)
-    if r.status_code != 200:
-        raise HoldingsError(f"HTTP {r.status_code}: {url}")
-    if len(r.content) < 100:
-        raise HoldingsError(f"Suspiciously small response ({len(r.content)} bytes): {url}")
-    return r
-
-
-def try_urls(
+def http_get(
     session: requests.Session,
-    urls: Iterable[str],
+    url: str,
     timeout: int,
-) -> tuple[str, requests.Response]:
-    errors: list[str] = []
-    for url in urls:
-        try:
-            return url, http_get(session, url, timeout)
-        except Exception as exc:
-            errors.append(f"{url}: {exc}")
-    raise HoldingsError("All candidate URLs failed: " + " | ".join(errors))
+    *,
+    headers: dict[str, str] | None = None,
+) -> requests.Response:
+
+    request_headers = HEADERS.copy()
+
+    if headers:
+        request_headers.update(headers)
+
+    response = session.get(
+        url,
+        headers=request_headers,
+        timeout=(10, timeout),
+        allow_redirects=True,
+    )
+
+    if response.status_code != 200:
+        raise HoldingsError(
+            f"HTTP {response.status_code}: {url}"
+        )
+
+    if len(response.content) < 100:
+        raise HoldingsError(
+            f"Suspiciously small response "
+            f"({len(response.content)} bytes): {url}"
+        )
+
+    return response
 
 
-# ---------------------------------------------------------------------------
-# GENERIC HELPERS
-# ---------------------------------------------------------------------------
+# ============================================================
+# GENERIC CLEANING
+# ============================================================
 
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+def clean_text(value: Any) -> str:
+    """
+    Convert provider text to plain clean text.
 
+    IMPORTANT:
+    Old fallback rows may contain:
 
-def iso_today() -> str:
-    return utc_now().date().isoformat()
+      <span class="truncated_text_single"
+            title="Novo Nordisk A/S">
+            Novo Nordisk A/..
+      </span>
 
+    We extract the title attribute BEFORE stripping tags.
+    """
 
-def to_float(x: Any) -> float | None:
-    if x is None or x is pd.NA:
-        return None
-    if isinstance(x, float) and pd.isna(x):
-        return None
-    s = str(x).strip()
-    if not s or s.upper() in {"-", "--", "N/A", "NA", "NONE", "NAN"}:
-        return None
-    negative = s.startswith("(") and s.endswith(")")
-    s = s.replace(",", "").replace("%", "").replace("$", "").strip("() ")
-    # Keep only numeric/scientific-notation characters.
-    s = re.sub(r"[^0-9eE+\-.]", "", s)
-    if not s:
-        return None
+    if value is None or value is pd.NA:
+        return ""
+
     try:
-        value = float(s)
-        return -value if negative else value
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+
+    text = str(value).strip()
+
+    if text.lower() in {
+        "",
+        "nan",
+        "none",
+        "null",
+    }:
+        return ""
+
+    # Decode entities first.
+    text = html_lib.unescape(text)
+
+    # Recover full tooltip value.
+    title_match = re.search(
+        r"""title\s*=\s*["']([^"']+)["']""",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    if title_match:
+        text = title_match.group(1)
+    else:
+        text = re.sub(
+            r"<[^>]+>",
+            " ",
+            text,
+        )
+
+    # Decode again in case title itself had &amp; etc.
+    text = html_lib.unescape(text)
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    )
+
+    return text.strip()
+
+
+def to_float(value: Any) -> float | None:
+
+    if value is None or value is pd.NA:
+        return None
+
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+
+    text = str(value).strip()
+
+    if not text:
+        return None
+
+    if text.upper() in {
+        "-",
+        "--",
+        "N/A",
+        "NA",
+        "NONE",
+        "NAN",
+        "NULL",
+    }:
+        return None
+
+    negative = (
+        text.startswith("(")
+        and text.endswith(")")
+    )
+
+    text = (
+        text
+        .replace(",", "")
+        .replace("%", "")
+        .replace("$", "")
+        .strip("() ")
+    )
+
+    text = re.sub(
+        r"[^0-9eE+\-.]",
+        "",
+        text,
+    )
+
+    if not text:
+        return None
+
+    try:
+        number = float(text)
+
+        if negative:
+            number = -number
+
+        return number
+
     except ValueError:
         return None
 
 
-def pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    cols = [(str(c), str(c).strip().lower()) for c in df.columns]
-    for candidate in candidates:
-        cand = candidate.lower()
-        for original, low in cols:
-            if cand in low:
-                return original
-    return None
+def normalize_date_value(
+    value: Any,
+) -> str | None:
 
-
-def clean_text(value: Any) -> str:
-    if value is None or value is pd.NA:
-        return ""
-    text = str(value).strip()
-    if text.lower() in {"nan", "none"}:
-        return ""
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
-
-
-def normalize_date_value(value: Any) -> str | None:
     if value is None:
         return None
-    if isinstance(value, (datetime, pd.Timestamp)):
+
+    if isinstance(
+        value,
+        (datetime, pd.Timestamp),
+    ):
         return value.date().isoformat()
+
     if isinstance(value, date):
         return value.isoformat()
 
     text = clean_text(value)
+
     if not text:
         return None
 
-    # yyyy-mm-dd
-    m = re.search(r"\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b", text)
-    if m:
+    patterns = [
+        (
+            r"\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b",
+            "ymd",
+        ),
+        (
+            r"\b(\d{1,2})/(\d{1,2})/(20\d{2})\b",
+            "mdy",
+        ),
+    ]
+
+    for pattern, style in patterns:
+
+        match = re.search(
+            pattern,
+            text,
+        )
+
+        if not match:
+            continue
+
         try:
-            return date(int(m.group(1)), int(m.group(2)), int(m.group(3))).isoformat()
+            if style == "ymd":
+                year = int(match.group(1))
+                month = int(match.group(2))
+                day = int(match.group(3))
+
+            else:
+                month = int(match.group(1))
+                day = int(match.group(2))
+                year = int(match.group(3))
+
+            return date(
+                year,
+                month,
+                day,
+            ).isoformat()
+
         except ValueError:
             pass
 
-    # mm/dd/yyyy
-    m = re.search(r"\b(\d{1,2})/(\d{1,2})/(20\d{2})\b", text)
-    if m:
+    for fmt in (
+        "%B %d, %Y",
+        "%b %d, %Y",
+        "%B %d %Y",
+        "%b %d %Y",
+    ):
+
         try:
-            return date(int(m.group(3)), int(m.group(1)), int(m.group(2))).isoformat()
+            return (
+                datetime
+                .strptime(text, fmt)
+                .date()
+                .isoformat()
+            )
+
         except ValueError:
             pass
 
-    # Month-name variants.
-    for fmt in ("%B %d, %Y", "%b %d, %Y", "%B %d %Y", "%b %d %Y"):
-        try:
-            return datetime.strptime(text, fmt).date().isoformat()
-        except ValueError:
-            pass
     return None
 
 
-def extract_date_from_text(text: str) -> str | None:
-    # Prefer dates close to "as of".
-    patterns = [
-        r"(?i)as\s+of[^0-9A-Za-z]{0,20}([A-Za-z]+\s+\d{1,2},?\s+20\d{2})",
-        r"(?i)as\s+of[^0-9]{0,20}(\d{1,2}/\d{1,2}/20\d{2})",
-        r"(?i)as\s+of[^0-9]{0,20}(20\d{2}-\d{1,2}-\d{1,2})",
-    ]
-    for pat in patterns:
-        m = re.search(pat, text)
-        if m:
-            parsed = normalize_date_value(m.group(1))
-            if parsed:
-                return parsed
+def extract_date_from_text(
+    text: str,
+) -> str | None:
 
-    # Otherwise inspect the first few explicit dates in the document.
-    candidates = re.findall(
-        r"\b(?:20\d{2}-\d{1,2}-\d{1,2}|\d{1,2}/\d{1,2}/20\d{2}|"
-        r"[A-Za-z]+\s+\d{1,2},?\s+20\d{2})\b",
-        text[:10000],
-    )
-    for candidate in candidates:
-        parsed = normalize_date_value(candidate)
+    patterns = [
+        (
+            r"(?i)as\s+of[^0-9A-Za-z]{0,20}"
+            r"([A-Za-z]+\s+\d{1,2},?\s+20\d{2})"
+        ),
+        (
+            r"(?i)as\s+of[^0-9]{0,20}"
+            r"(\d{1,2}/\d{1,2}/20\d{2})"
+        ),
+        (
+            r"(?i)as\s+of[^0-9]{0,20}"
+            r"(20\d{2}-\d{1,2}-\d{1,2})"
+        ),
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            text,
+        )
+
+        if not match:
+            continue
+
+        parsed = normalize_date_value(
+            match.group(1)
+        )
+
         if parsed:
             return parsed
-    return None
 
-
-def recursive_find_date(payload: Any) -> str | None:
-    dateish_keys = (
-        "asofdate",
-        "as_of_date",
-        "asof",
-        "effectiveDate",
-        "effective_date",
-        "portfolioDate",
-        "portfolio_date",
-        "date",
+    candidates = re.findall(
+        r"\b(?:"
+        r"20\d{2}-\d{1,2}-\d{1,2}"
+        r"|"
+        r"\d{1,2}/\d{1,2}/20\d{2}"
+        r"|"
+        r"[A-Za-z]+\s+\d{1,2},?\s+20\d{2}"
+        r")\b",
+        text[:20000],
     )
-    stack = [payload]
-    while stack:
-        item = stack.pop()
-        if isinstance(item, dict):
-            # First inspect likely date keys.
-            for key, value in item.items():
-                if str(key).lower() in {k.lower() for k in dateish_keys}:
-                    parsed = normalize_date_value(value)
-                    if parsed:
-                        return parsed
-            stack.extend(item.values())
-        elif isinstance(item, list):
-            stack.extend(item)
+
+    for candidate in candidates:
+
+        parsed = normalize_date_value(
+            candidate
+        )
+
+        if parsed:
+            return parsed
+
     return None
 
 
-def sniff_csv(text: str, must_contain: list[str]) -> tuple[pd.DataFrame, int]:
-    lines = text.splitlines()
-    header_idx = None
-    for i, line in enumerate(lines[:50]):
-        low = line.lower()
-        if all(tok.lower() in low for tok in must_contain):
-            header_idx = i
-            break
-    if header_idx is None:
-        raise HoldingsError(
-            f"Could not locate CSV header containing {must_contain}. "
-            f"First lines: {lines[:5]}"
+def pick_col(
+    df: pd.DataFrame,
+    candidates: list[str],
+) -> str | None:
+
+    columns = [
+        (
+            str(column),
+            clean_text(column).lower(),
         )
-    df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])), dtype=str)
-    df.columns = [clean_text(c) for c in df.columns]
-    return df, header_idx
+        for column in df.columns
+    ]
+
+    # Exact-ish match first.
+    for candidate in candidates:
+
+        candidate_lower = candidate.lower()
+
+        for original, lowered in columns:
+
+            if lowered == candidate_lower:
+                return original
+
+    # Contains match second.
+    for candidate in candidates:
+
+        candidate_lower = candidate.lower()
+
+        for original, lowered in columns:
+
+            if candidate_lower in lowered:
+                return original
+
+    return None
 
 
 def standardise(
@@ -426,94 +605,500 @@ def standardise(
     isin: str | None = None,
     sedol: str | None = None,
 ) -> pd.DataFrame:
-    out = pd.DataFrame(index=df.index)
 
-    out["raw_ticker"] = (
-        df[ticker].map(clean_text) if ticker and ticker in df.columns else ""
-    )
-    out["raw_name"] = (
-        df[name].map(clean_text) if name and name in df.columns else ""
-    )
-    out["weight"] = (
-        df[weight].map(to_float) if weight and weight in df.columns else pd.NA
-    )
-    out["shares"] = (
-        df[shares].map(to_float) if shares and shares in df.columns else pd.NA
-    )
-    out["market_value"] = (
-        df[mval].map(to_float) if mval and mval in df.columns else pd.NA
-    )
-    out["isin"] = (
-        df[isin].map(clean_text) if isin and isin in df.columns else ""
-    )
-    out["sedol"] = (
-        df[sedol].map(clean_text) if sedol and sedol in df.columns else ""
+    output = pd.DataFrame(
+        index=df.index
     )
 
-    out = out[(out["raw_name"] != "") | (out["raw_ticker"] != "")].copy()
-    out["raw_ticker"] = out["raw_ticker"].astype(str).str.strip()
-    out["raw_name"] = out["raw_name"].astype(str).str.strip()
-    out["isin"] = out["isin"].astype(str).str.strip().str.upper()
-    out["sedol"] = out["sedol"].astype(str).str.strip().str.upper()
-    return out.reset_index(drop=True)[STD_COLS]
-
-
-def drop_nonsecurity_rows(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out["raw_ticker"] = out["raw_ticker"].map(clean_text)
-    out["raw_name"] = out["raw_name"].map(clean_text)
-
-    # The existing Excel model is security/ticker based, so blank-ticker cash,
-    # FX and derivative rows are excluded from the holdings stream.
-    out = out[out["raw_ticker"] != ""].copy()
-
-    ticker_upper = out["raw_ticker"].str.upper()
-    name_upper = out["raw_name"].str.upper()
-
-    # Remove obvious repeated headers/disclaimers and provider cash/FX lines.
-    bad = ticker_upper.isin(
-        {
-            "TICKER", "SYMBOL", "N/A", "NA", "NONE", "--",
-            "USD", "EUR", "GBP", "CHF", "CAD", "AUD", "JPY", "HKD",
-            "CNY", "TWD", "KRW",
-        }
-    )
-    cash_fx = (
-        ticker_upper.str.startswith("$")
-        | ticker_upper.str.contains(r"CASH", regex=True)
-        | name_upper.str.fullmatch(
-            r"(US DOLLAR|EURO|POUND STERLING|SWISS FRANC|"
-            r"HONG KONG DOLLAR|YUAN RENMINBI|BRAZILIAN REAL|"
-            r"NEW TAIWAN DOLLAR|OTHER/CASH|CASH)",
-            na=False,
+    if ticker and ticker in df.columns:
+        output["raw_ticker"] = (
+            df[ticker]
+            .map(clean_text)
         )
-    )
-    out = out[~(bad | cash_fx)].copy()
-    return out.reset_index(drop=True)
+    else:
+        output["raw_ticker"] = ""
 
+    if name and name in df.columns:
+        output["raw_name"] = (
+            df[name]
+            .map(clean_text)
+        )
+    else:
+        output["raw_name"] = ""
+
+    if weight and weight in df.columns:
+        output["weight"] = (
+            df[weight]
+            .map(to_float)
+        )
+    else:
+        output["weight"] = pd.NA
+
+    if shares and shares in df.columns:
+        output["shares"] = (
+            df[shares]
+            .map(to_float)
+        )
+    else:
+        output["shares"] = pd.NA
+
+    if mval and mval in df.columns:
+        output["market_value"] = (
+            df[mval]
+            .map(to_float)
+        )
+    else:
+        output["market_value"] = pd.NA
+
+    if isin and isin in df.columns:
+        output["isin"] = (
+            df[isin]
+            .map(clean_text)
+        )
+    else:
+        output["isin"] = ""
+
+    if sedol and sedol in df.columns:
+        output["sedol"] = (
+            df[sedol]
+            .map(clean_text)
+        )
+    else:
+        output["sedol"] = ""
+
+    output = output[
+        (
+            output["raw_ticker"].ne("")
+            |
+            output["raw_name"].ne("")
+        )
+    ].copy()
+
+    output["raw_ticker"] = (
+        output["raw_ticker"]
+        .astype(str)
+        .str.strip()
+    )
+
+    output["raw_name"] = (
+        output["raw_name"]
+        .astype(str)
+        .str.strip()
+    )
+
+    output["isin"] = (
+        output["isin"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    output["sedol"] = (
+        output["sedol"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    return (
+        output[
+            STD_COLS
+        ]
+        .reset_index(drop=True)
+    )
+
+
+# ============================================================
+# NON-SECURITY FILTER
+# ============================================================
+
+def is_nonsecurity(
+    ticker: str,
+    name: str,
+) -> bool:
+
+    ticker_upper = (
+        clean_text(ticker)
+        .upper()
+        .strip()
+    )
+
+    name_upper = (
+        clean_text(name)
+        .upper()
+        .strip()
+    )
+
+    if not ticker_upper:
+        return True
+
+    if ticker_upper in {
+        "TICKER",
+        "SYMBOL",
+        "N/A",
+        "NA",
+        "NONE",
+        "--",
+        "USD",
+        "EUR",
+        "GBP",
+        "CHF",
+        "CAD",
+        "AUD",
+        "JPY",
+        "HKD",
+        "CNY",
+        "TWD",
+        "KRW",
+        "AGPXX",
+        "BNYMLEND",
+    }:
+        return True
+
+    if ticker_upper.startswith("$"):
+        return True
+
+    if "CASH" in ticker_upper:
+        return True
+
+    if name_upper in {
+        "US DOLLAR",
+        "USD CASH",
+        "EURO",
+        "POUND STERLING",
+        "SWISS FRANC",
+        "HONG KONG DOLLAR",
+        "YUAN RENMINBI",
+        "BRAZILIAN REAL",
+        "NEW TAIWAN DOLLAR",
+        "OTHER/CASH",
+        "CASH",
+    }:
+        return True
+
+    if "SECURITIES LENDING" in name_upper:
+        return True
+
+    if (
+        "GOVERNMENT & AGENCY PORTFOLIO"
+        in name_upper
+    ):
+        return True
+
+    return False
+
+
+def drop_nonsecurity_rows(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+
+    output = df.copy()
+
+    output["raw_ticker"] = (
+        output["raw_ticker"]
+        .map(clean_text)
+    )
+
+    output["raw_name"] = (
+        output["raw_name"]
+        .map(clean_text)
+    )
+
+    keep = [
+        not is_nonsecurity(
+            ticker,
+            name,
+        )
+        for ticker, name in zip(
+            output["raw_ticker"],
+            output["raw_name"],
+        )
+    ]
+
+    return (
+        output.loc[keep]
+        .reset_index(drop=True)
+    )
+
+
+# ============================================================
+# WEIGHTS
+# ============================================================
 
 def maybe_recompute_from_market_value(
     df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, str]:
-    """Use exact market values when coverage is complete.
 
-    We only recompute when every published security row has a non-negative
-    market value. This prevents a partially parsed value column from distorting
-    the denominator.
-    """
-    out = df.copy()
-    if out.empty:
-        return out, "provider_weight"
+    output = df.copy()
 
-    mval = pd.to_numeric(out["market_value"], errors="coerce")
-    if mval.notna().all() and float(mval.sum()) > 0:
-        total = float(mval.sum())
-        out["weight"] = mval / total * 100.0
-        return out, "market_value_recomputed"
+    if output.empty:
+        return output, "provider_weight"
 
-    return out, "provider_weight"
+    market_value = pd.to_numeric(
+        output["market_value"],
+        errors="coerce",
+    )
+
+    if (
+        market_value.notna().all()
+        and
+        (market_value >= 0).all()
+        and
+        float(market_value.sum()) > 0
+    ):
+
+        total = float(
+            market_value.sum()
+        )
+
+        output["weight"] = (
+            market_value
+            / total
+            * 100.0
+        )
+
+        return (
+            output,
+            "market_value_recomputed",
+        )
+
+    return (
+        output,
+        "provider_weight",
+    )
 
 
+# ============================================================
+# CSV / EXCEL PARSING
+# ============================================================
+
+def sniff_csv(
+    text: str,
+    must_contain: list[str],
+) -> pd.DataFrame:
+
+    lines = text.splitlines()
+
+    header_index = None
+
+    for index, line in enumerate(
+        lines[:100]
+    ):
+
+        lowered = line.lower()
+
+        if all(
+            token.lower() in lowered
+            for token in must_contain
+        ):
+            header_index = index
+            break
+
+    if header_index is None:
+        raise HoldingsError(
+            "Could not locate CSV header "
+            f"containing {must_contain}. "
+            f"First lines: {lines[:5]}"
+        )
+
+    frame = pd.read_csv(
+        io.StringIO(
+            "\n".join(
+                lines[header_index:]
+            )
+        ),
+        dtype=str,
+    )
+
+    frame.columns = [
+        clean_text(column)
+        for column in frame.columns
+    ]
+
+    return frame
+
+
+def excel_with_detected_header(
+    content: bytes,
+    *,
+    required_tokens: tuple[str, ...],
+    max_scan_rows: int = 50,
+) -> tuple[
+    pd.DataFrame,
+    str | None,
+]:
+
+    raw = pd.read_excel(
+        io.BytesIO(content),
+        header=None,
+        dtype=str,
+    )
+
+    header_index = None
+
+    for index in range(
+        min(
+            max_scan_rows,
+            len(raw),
+        )
+    ):
+
+        row_text = " | ".join(
+            clean_text(value).lower()
+            for value
+            in raw.iloc[index].tolist()
+        )
+
+        if all(
+            token.lower() in row_text
+            for token
+            in required_tokens
+        ):
+            header_index = index
+            break
+
+    if header_index is None:
+        raise HoldingsError(
+            "Could not locate Excel holdings header "
+            f"containing {required_tokens}"
+        )
+
+    source_date = None
+
+    for index in range(header_index):
+
+        row_text = " ".join(
+            clean_text(value)
+            for value
+            in raw.iloc[index].tolist()
+        )
+
+        parsed = extract_date_from_text(
+            row_text
+        )
+
+        if parsed:
+            source_date = parsed
+            break
+
+    frame = (
+        raw
+        .iloc[
+            header_index + 1 :
+        ]
+        .copy()
+    )
+
+    frame.columns = [
+        clean_text(column)
+        for column
+        in raw.iloc[
+            header_index
+        ].tolist()
+    ]
+
+    return (
+        frame,
+        source_date,
+    )
+
+
+def parse_downloaded_holdings(
+    response: requests.Response,
+    *,
+    provider: str,
+    source_date_hint: str | None = None,
+) -> tuple[
+    pd.DataFrame,
+    str | None,
+]:
+
+    content_type = (
+        response
+        .headers
+        .get(
+            "content-type",
+            "",
+        )
+        .lower()
+    )
+
+    final_url = (
+        str(response.url)
+        .lower()
+    )
+
+    is_excel = (
+        "spreadsheet" in content_type
+        or
+        "excel" in content_type
+        or
+        final_url.endswith(
+            (
+                ".xls",
+                ".xlsx",
+            )
+        )
+        or
+        response.content[:2]
+        == b"PK"
+    )
+
+    if is_excel:
+
+        frame, source_date = (
+            excel_with_detected_header(
+                response.content,
+                required_tokens=(
+                    "ticker",
+                ),
+            )
+        )
+
+        return (
+            frame,
+            source_date
+            or source_date_hint,
+        )
+
+    text = response.text
+
+    if (
+        "ticker"
+        in text[:10000].lower()
+        and
+        ","
+        in text[:3000]
+    ):
+
+        frame = sniff_csv(
+            text,
+            ["ticker"],
+        )
+
+        source_date = (
+            extract_date_from_text(
+                text[:20000]
+            )
+            or source_date_hint
+        )
+
+        return (
+            frame,
+            source_date,
+        )
+
+    raise HoldingsError(
+        f"{provider}: response was not "
+        "recognisable CSV or Excel "
+        f"(content-type={content_type}, "
+        f"url={response.url})"
+    )
+
+
+# ============================================================
+# DOWNLOAD LINK DISCOVERY
+# ============================================================
 
 def find_download_link(
     html_text: str,
@@ -522,82 +1107,500 @@ def find_download_link(
     text_contains: tuple[str, ...] = (),
     href_contains: tuple[str, ...] = (),
 ) -> str | None:
-    """Return the first matching absolute link from provider HTML."""
+
     try:
-        root = lxml_html.fromstring(html_text)
+        root = lxml_html.fromstring(
+            html_text
+        )
+
     except Exception:
         return None
 
-    text_tokens = tuple(t.lower() for t in text_contains)
-    href_tokens = tuple(t.lower() for t in href_contains)
+    text_tokens = tuple(
+        token.lower()
+        for token
+        in text_contains
+    )
 
-    ranked: list[tuple[int, str]] = []
-    for a in root.xpath("//a[@href]"):
-        href = clean_text(a.get("href"))
-        if not href or href.lower().startswith(("javascript:", "mailto:", "#")):
-            continue
-        label = " ".join(clean_text(x) for x in a.itertext()).strip().lower()
-        href_low = href.lower()
+    href_tokens = tuple(
+        token.lower()
+        for token
+        in href_contains
+    )
 
-        text_ok = not text_tokens or all(t in label for t in text_tokens)
-        href_ok = not href_tokens or all(t in href_low for t in href_tokens)
-        if not (text_ok and href_ok):
-            continue
+    matches: list[
+        tuple[
+            int,
+            str,
+        ]
+    ] = []
 
-        score = 0
-        if "download" in label:
-            score += 3
-        if "full holdings" in label:
-            score += 3
-        if href_low.endswith((".csv", ".xls", ".xlsx")):
-            score += 3
-        if "holding" in href_low:
-            score += 1
-        ranked.append((score, urljoin(base_url, href)))
+    for anchor in root.xpath(
+        "//a[@href]"
+    ):
 
-    if not ranked:
-        return None
-    ranked.sort(key=lambda x: x[0], reverse=True)
-    return ranked[0][1]
-
-
-def excel_with_detected_header(
-    content: bytes,
-    *,
-    required_tokens: tuple[str, ...] = ("ticker",),
-    max_scan_rows: int = 40,
-) -> tuple[pd.DataFrame, str | None]:
-    """Parse a provider XLS/XLSX whose metadata precedes the real header."""
-    raw = pd.read_excel(io.BytesIO(content), header=None, dtype=str)
-
-    hdr = None
-    for i in range(min(max_scan_rows, len(raw))):
-        joined = " | ".join(clean_text(v).lower() for v in raw.iloc[i].tolist())
-        if all(tok.lower() in joined for tok in required_tokens):
-            hdr = i
-            break
-
-    if hdr is None:
-        raise HoldingsError(
-            f"Could not find Excel header containing {required_tokens}"
+        href = clean_text(
+            anchor.get("href")
         )
 
-    source_date = None
-    for i in range(hdr):
-        row_text = " ".join(clean_text(v) for v in raw.iloc[i].tolist())
-        parsed = extract_date_from_text(row_text)
-        if parsed:
-            source_date = parsed
-            break
+        if not href:
+            continue
 
-    df = raw.iloc[hdr + 1 :].copy()
-    df.columns = [clean_text(c) for c in raw.iloc[hdr].tolist()]
-    return df, source_date
+        if href.lower().startswith(
+            (
+                "javascript:",
+                "mailto:",
+                "#",
+            )
+        ):
+            continue
 
+        label = " ".join(
+            clean_text(part)
+            for part
+            in anchor.itertext()
+        ).lower()
+
+        href_lower = (
+            href.lower()
+        )
+
+        if text_tokens:
+
+            if not all(
+                token in label
+                for token
+                in text_tokens
+            ):
+                continue
+
+        if href_tokens:
+
+            if not all(
+                token in href_lower
+                for token
+                in href_tokens
+            ):
+                continue
+
+        score = 0
+
+        if "download" in label:
+            score += 3
+
+        if "full holdings" in label:
+            score += 3
+
+        if href_lower.endswith(
+            (
+                ".csv",
+                ".xls",
+                ".xlsx",
+            )
+        ):
+            score += 3
+
+        if "holding" in href_lower:
+            score += 1
+
+        matches.append(
+            (
+                score,
+                urljoin(
+                    base_url,
+                    href,
+                ),
+            )
+        )
+
+    if not matches:
+        return None
+
+    matches.sort(
+        key=lambda item: item[0],
+        reverse=True,
+    )
+
+    return matches[0][1]
+
+
+# ============================================================
+# YAHOO SYMBOL NORMALISATION
+# ============================================================
+
+YAHOO_EXCHANGE_SUFFIXES = {
+    "TW",
+    "KS",
+    "KQ",
+    "L",
+    "PA",
+    "AS",
+    "DE",
+    "SW",
+    "TO",
+    "HK",
+    "T",
+    "AX",
+    "MC",
+    "MI",
+    "HE",
+    "ST",
+    "CO",
+    "OL",
+    "BR",
+    "LS",
+    "SI",
+    "NZ",
+    "TA",
+}
+
+
+def yahoo_ticker(
+    raw_ticker: str,
+) -> str:
+
+    ticker = (
+        clean_text(raw_ticker)
+        .upper()
+        .strip()
+    )
+
+    ticker = re.sub(
+        r"\s+(US|UN|UW|UQ|UR|UF)$",
+        "",
+        ticker,
+    )
+
+    # Preserve actual exchange suffixes.
+    match = re.fullmatch(
+        r"[A-Z0-9]+\.([A-Z]{1,4})",
+        ticker,
+    )
+
+    if match:
+
+        suffix = match.group(1)
+
+        if suffix in YAHOO_EXCHANGE_SUFFIXES:
+            return ticker
+
+    # US class shares:
+    # BRK.B -> BRK-B
+    ticker = (
+        ticker
+        .replace("/", "-")
+        .replace(".", "-")
+    )
+
+    return ticker
+
+
+# ============================================================
+# YAHOO PRICES
+# ============================================================
+
+def _field_frame(
+    data: pd.DataFrame,
+    field: str,
+    tickers: list[str],
+) -> pd.DataFrame:
+
+    if isinstance(
+        data.columns,
+        pd.MultiIndex,
+    ):
+
+        first_level = (
+            data.columns
+            .get_level_values(0)
+        )
+
+        if field not in first_level:
+            return pd.DataFrame(
+                index=data.index
+            )
+
+        frame = data[field]
+
+        if isinstance(
+            frame,
+            pd.Series,
+        ):
+
+            name = (
+                tickers[0]
+                if tickers
+                else field
+            )
+
+            frame = frame.to_frame(
+                name
+            )
+
+        return frame
+
+    if field not in data.columns:
+        return pd.DataFrame(
+            index=data.index
+        )
+
+    series = data[field]
+
+    if isinstance(
+        series,
+        pd.Series,
+    ):
+
+        name = (
+            tickers[0]
+            if len(tickers) == 1
+            else field
+        )
+
+        return series.to_frame(
+            name
+        )
+
+    return series
+
+
+def yahoo_latest_prices(
+    tickers: Iterable[str],
+) -> dict[str, float]:
+
+    import yfinance as yf
+
+    raw_to_yahoo: dict[
+        str,
+        str,
+    ] = {}
+
+    for raw in tickers:
+
+        raw_clean = clean_text(
+            raw
+        )
+
+        if not raw_clean:
+            continue
+
+        converted = yahoo_ticker(
+            raw_clean
+        )
+
+        if converted:
+            raw_to_yahoo[
+                raw_clean
+            ] = converted
+
+    yahoo_symbols = sorted(
+        set(
+            raw_to_yahoo.values()
+        )
+    )
+
+    if not yahoo_symbols:
+        return {}
+
+    try:
+
+        data = yf.download(
+            tickers=yahoo_symbols,
+            period="5d",
+            interval="1d",
+            auto_adjust=False,
+            keepna=False,
+            progress=False,
+            threads=True,
+            timeout=15,
+            group_by="column",
+        )
+
+    except Exception as exc:
+
+        raise HoldingsError(
+            "Yahoo latest-price download failed: "
+            f"{exc}"
+        ) from exc
+
+    if data is None or len(data) == 0:
+
+        raise HoldingsError(
+            "Yahoo returned no price history"
+        )
+
+    closes = _field_frame(
+        data,
+        "Close",
+        yahoo_symbols,
+    )
+
+    yahoo_prices: dict[
+        str,
+        float,
+    ] = {}
+
+    for symbol in yahoo_symbols:
+
+        if symbol not in closes.columns:
+            continue
+
+        series = pd.to_numeric(
+            closes[symbol],
+            errors="coerce",
+        ).dropna()
+
+        if series.empty:
+            continue
+
+        price = float(
+            series.iloc[-1]
+        )
+
+        if price > 0:
+            yahoo_prices[
+                symbol
+            ] = price
+
+    result: dict[
+        str,
+        float,
+    ] = {}
+
+    for raw, symbol in (
+        raw_to_yahoo.items()
+    ):
+
+        if symbol in yahoo_prices:
+
+            result[
+                raw
+            ] = yahoo_prices[
+                symbol
+            ]
+
+    return result
+
+
+def fill_std_market_values_from_yahoo(
+    frame: pd.DataFrame,
+    *,
+    label: str,
+) -> pd.DataFrame:
+
+    output = frame.copy()
+
+    market_value = pd.to_numeric(
+        output["market_value"],
+        errors="coerce",
+    )
+
+    shares = pd.to_numeric(
+        output["shares"],
+        errors="coerce",
+    )
+
+    need = (
+        market_value.isna()
+        &
+        shares.notna()
+        &
+        (shares > 0)
+        &
+        output[
+            "raw_ticker"
+        ]
+        .astype(str)
+        .ne("")
+    )
+
+    if not need.any():
+        return output
+
+    required_tickers = (
+        output.loc[
+            need,
+            "raw_ticker",
+        ]
+        .map(clean_text)
+    )
+
+    prices = yahoo_latest_prices(
+        required_tickers
+    )
+
+    filled = 0
+
+    for index in (
+        output.index[need]
+    ):
+
+        ticker = clean_text(
+            output.at[
+                index,
+                "raw_ticker",
+            ]
+        )
+
+        share_count = to_float(
+            output.at[
+                index,
+                "shares",
+            ]
+        )
+
+        price = prices.get(
+            ticker
+        )
+
+        if (
+            price is None
+            or
+            share_count is None
+            or
+            share_count <= 0
+        ):
+            continue
+
+        output.at[
+            index,
+            "market_value",
+        ] = (
+            share_count
+            * price
+        )
+
+        filled += 1
+
+    remaining = int(
+        pd.to_numeric(
+            output[
+                "market_value"
+            ],
+            errors="coerce",
+        )
+        .isna()
+        .sum()
+    )
+
+    print(
+        f"[{label}] Yahoo MV backfill: "
+        f"{filled} filled, "
+        f"{remaining} blank",
+        file=sys.stderr,
+    )
+
+    return output
+
+
+# ============================================================
+# ISHARES TICKER QUALIFICATION
+# ============================================================
 
 ISHARES_EXCHANGE_SUFFIX = {
     "Taiwan Stock Exchange": ".TW",
     "Korea Exchange (Stock Market)": ".KS",
+    "Kosdaq Market": ".KQ",
     "Tokyo Stock Exchange": ".T",
     "Hong Kong Exchanges And Clearing Ltd": ".HK",
     "London Stock Exchange": ".L",
@@ -622,629 +1625,1635 @@ ISHARES_EXCHANGE_SUFFIX = {
 }
 
 
-def qualify_ishares_ticker(raw_ticker: Any, exchange: Any) -> str:
-    ticker = clean_text(raw_ticker)
-    exch = clean_text(exchange)
+def qualify_ishares_ticker(
+    raw_ticker: Any,
+    exchange: Any,
+) -> str:
+
+    ticker = clean_text(
+        raw_ticker
+    )
+
+    exchange_clean = clean_text(
+        exchange
+    )
+
     if not ticker:
         return ""
-    suffix = ISHARES_EXCHANGE_SUFFIX.get(exch)
+
+    suffix = (
+        ISHARES_EXCHANGE_SUFFIX
+        .get(
+            exchange_clean
+        )
+    )
+
     if not suffix:
         return ticker
-    # Do not double-qualify a provider ticker.
+
     if "." in ticker:
         return ticker
-    return ticker + suffix
+
+    return (
+        ticker
+        + suffix
+    )
 
 
-def parse_firsttrust_dom(html_text: str) -> pd.DataFrame:
-    """Parse First Trust's holdings rows even when pandas.read_html misses them."""
-    try:
-        root = lxml_html.fromstring(html_text)
-    except Exception as exc:
-        raise HoldingsError(f"First Trust HTML parse failed: {exc}") from exc
+# ============================================================
+# STATE STREET
+# ============================================================
 
-    rows: list[dict[str, Any]] = []
-    for tr in root.xpath("//tr"):
-        cells = [
-            " ".join(clean_text(x) for x in cell.itertext()).strip()
-            for cell in tr.xpath("./th|./td")
+def fetch_ssga(
+    session: requests.Session,
+    etf: str,
+    timeout: int,
+) -> FetchResult:
+
+    url = SSGA_URL.format(
+        ticker=etf.lower()
+    )
+
+    response = http_get(
+        session,
+        url,
+        timeout,
+    )
+
+    raw = pd.read_excel(
+        io.BytesIO(
+            response.content
+        ),
+        header=None,
+        dtype=str,
+    )
+
+    header_index = None
+
+    for index in range(
+        min(
+            30,
+            len(raw),
+        )
+    ):
+
+        row_text = " ".join(
+            clean_text(value).lower()
+            for value
+            in raw.iloc[
+                index
+            ].tolist()
+        )
+
+        if (
+            "ticker"
+            in row_text
+            and
+            "weight"
+            in row_text
+        ):
+            header_index = index
+            break
+
+    if header_index is None:
+
+        raise HoldingsError(
+            f"{etf}: State Street holdings "
+            "header not found"
+        )
+
+    source_date = None
+
+    for index in range(
+        header_index
+    ):
+
+        row_text = " ".join(
+            clean_text(value)
+            for value
+            in raw.iloc[
+                index
+            ].tolist()
+        )
+
+        parsed = extract_date_from_text(
+            row_text
+        )
+
+        if parsed:
+            source_date = parsed
+            break
+
+    frame = (
+        raw
+        .iloc[
+            header_index + 1 :
         ]
-        cells = [c for c in cells if c != ""]
+        .copy()
+    )
+
+    frame.columns = [
+        clean_text(column)
+        for column
+        in raw.iloc[
+            header_index
+        ].tolist()
+    ]
+
+    result = standardise(
+        frame,
+        ticker=pick_col(
+            frame,
+            ["ticker"],
+        ),
+        name=pick_col(
+            frame,
+            [
+                "name",
+                "security",
+            ],
+        ),
+        weight=pick_col(
+            frame,
+            ["weight"],
+        ),
+        shares=pick_col(
+            frame,
+            [
+                "shares held",
+                "shares",
+            ],
+        ),
+        mval=pick_col(
+            frame,
+            [
+                "market value",
+            ],
+        ),
+        isin=pick_col(
+            frame,
+            ["isin"],
+        ),
+        sedol=pick_col(
+            frame,
+            ["sedol"],
+        ),
+    )
+
+    result = drop_nonsecurity_rows(
+        result
+    )
+
+    # State Street export currently gives us precise
+    # shares + weights but MV can be blank.
+    #
+    # Fill MV from shares x current Yahoo price.
+    #
+    # DO NOT recompute weights from these values because
+    # State Street's official provider weight is preferred.
+    result = (
+        fill_std_market_values_from_yahoo(
+            result,
+            label=etf,
+        )
+    )
+
+    return FetchResult(
+        result,
+        source_date or iso_today(),
+        "provider_weight",
+    )
+
+
+# ============================================================
+# ISHARES / ACWI
+# ============================================================
+
+def fetch_ishares(
+    session: requests.Session,
+    etf: str,
+    timeout: int,
+) -> FetchResult:
+
+    response = http_get(
+        session,
+        ISHARES_ACWI_URL,
+        timeout,
+    )
+
+    text = response.text
+
+    frame = sniff_csv(
+        text,
+        [
+            "ticker",
+            "name",
+            "weight",
+        ],
+    )
+
+    ticker_column = pick_col(
+        frame,
+        ["ticker"],
+    )
+
+    exchange_column = pick_col(
+        frame,
+        ["exchange"],
+    )
+
+    if (
+        ticker_column
+        and
+        exchange_column
+    ):
+
+        frame = frame.copy()
+
+        frame[
+            ticker_column
+        ] = [
+            qualify_ishares_ticker(
+                ticker,
+                exchange,
+            )
+            for ticker, exchange
+            in zip(
+                frame[
+                    ticker_column
+                ],
+                frame[
+                    exchange_column
+                ],
+            )
+        ]
+
+    result_all = standardise(
+        frame,
+        ticker=ticker_column,
+        name=pick_col(
+            frame,
+            ["name"],
+        ),
+        weight=pick_col(
+            frame,
+            ["weight"],
+        ),
+        shares=pick_col(
+            frame,
+            [
+                "quantity",
+                "shares",
+            ],
+        ),
+        mval=pick_col(
+            frame,
+            [
+                "market value",
+            ],
+        ),
+        isin=pick_col(
+            frame,
+            ["isin"],
+        ),
+        sedol=pick_col(
+            frame,
+            ["sedol"],
+        ),
+    )
+
+    # Use market values before removing cash / FX,
+    # preserving provider denominator.
+    result_all, precision = (
+        maybe_recompute_from_market_value(
+            result_all
+        )
+    )
+
+    result = drop_nonsecurity_rows(
+        result_all
+    )
+
+    source_date = (
+        extract_date_from_text(
+            text[:30000]
+        )
+        or iso_today()
+    )
+
+    return FetchResult(
+        result,
+        source_date,
+        precision,
+    )
+
+
+# ============================================================
+# GLOBAL X
+# ============================================================
+
+def fetch_globalx(
+    session: requests.Session,
+    etf: str,
+    timeout: int,
+) -> FetchResult:
+
+    page_url = (
+        GLOBALX_PAGE_URL
+        .format(
+            ticker=etf.upper()
+        )
+    )
+
+    page = http_get(
+        session,
+        page_url,
+        timeout,
+    )
+
+    source_date = (
+        extract_date_from_text(
+            page.text[:50000]
+        )
+        or iso_today()
+    )
+
+    csv_url = (
+        find_download_link(
+            page.text,
+            page.url,
+            text_contains=(
+                "full holdings",
+            ),
+            href_contains=(
+                ".csv",
+            ),
+        )
+    )
+
+    # Fallback discovery if link text changes.
+    if not csv_url:
+
+        try:
+
+            root = lxml_html.fromstring(
+                page.text
+            )
+
+            candidates: list[
+                tuple[
+                    int,
+                    str,
+                ]
+            ] = []
+
+            for anchor in root.xpath(
+                "//a[@href]"
+            ):
+
+                href = clean_text(
+                    anchor.get(
+                        "href"
+                    )
+                )
+
+                lowered = (
+                    href.lower()
+                )
+
+                if ".csv" not in lowered:
+                    continue
+
+                score = 0
+
+                if (
+                    etf.lower()
+                    in lowered
+                ):
+                    score += 3
+
+                if (
+                    "holding"
+                    in lowered
+                ):
+                    score += 2
+
+                candidates.append(
+                    (
+                        score,
+                        urljoin(
+                            page.url,
+                            href,
+                        ),
+                    )
+                )
+
+            if candidates:
+
+                candidates.sort(
+                    key=lambda item: item[0],
+                    reverse=True,
+                )
+
+                csv_url = (
+                    candidates[0][1]
+                )
+
+        except Exception:
+            pass
+
+    if not csv_url:
+
+        raise HoldingsError(
+            f"{etf}: Global X "
+            "Full Holdings CSV "
+            "link not found"
+        )
+
+    response = http_get(
+        session,
+        csv_url,
+        timeout,
+    )
+
+    frame, download_date = (
+        parse_downloaded_holdings(
+            response,
+            provider="Global X",
+            source_date_hint=source_date,
+        )
+    )
+
+    result_all = standardise(
+        frame,
+        ticker=pick_col(
+            frame,
+            ["ticker"],
+        ),
+        name=pick_col(
+            frame,
+            ["name"],
+        ),
+        weight=pick_col(
+            frame,
+            [
+                "% of net assets",
+                "net assets",
+                "weight",
+            ],
+        ),
+        shares=pick_col(
+            frame,
+            [
+                "shares held",
+                "shares",
+                "quantity",
+            ],
+        ),
+        mval=pick_col(
+            frame,
+            ["market value"],
+        ),
+        isin=pick_col(
+            frame,
+            ["isin"],
+        ),
+        sedol=pick_col(
+            frame,
+            ["sedol"],
+        ),
+    )
+
+    result_all, precision = (
+        maybe_recompute_from_market_value(
+            result_all
+        )
+    )
+
+    result = drop_nonsecurity_rows(
+        result_all
+    )
+
+    return FetchResult(
+        result,
+        download_date
+        or source_date,
+        precision,
+    )
+
+
+# ============================================================
+# FIRST TRUST / GRID
+# ============================================================
+
+def parse_firsttrust_dom(
+    html_text: str,
+) -> pd.DataFrame:
+
+    try:
+        root = lxml_html.fromstring(
+            html_text
+        )
+
+    except Exception as exc:
+
+        raise HoldingsError(
+            "First Trust HTML parse failed: "
+            f"{exc}"
+        ) from exc
+
+    records: list[
+        dict[str, Any]
+    ] = []
+
+    for row in root.xpath(
+        "//tr"
+    ):
+
+        cells = [
+            " ".join(
+                clean_text(part)
+                for part
+                in cell.itertext()
+            ).strip()
+            for cell
+            in row.xpath(
+                "./th|./td"
+            )
+        ]
+
+        cells = [
+            cell
+            for cell
+            in cells
+            if cell != ""
+        ]
+
         if len(cells) < 6:
             continue
 
-        # Expected layout:
-        # Security Name | Identifier | CUSIP | Classification |
-        # Shares / Quantity | Market Value | Weighting
-        weight = to_float(cells[-1])
-        mval = to_float(cells[-2])
-        shares = to_float(cells[-3])
-        if weight is None or mval is None or shares is None:
+        # First Trust layout is normally:
+        #
+        # Security Name
+        # Identifier
+        # CUSIP
+        # Classification
+        # Shares
+        # Market Value
+        # Weighting
+
+        weight = to_float(
+            cells[-1]
+        )
+
+        market_value = to_float(
+            cells[-2]
+        )
+
+        shares = to_float(
+            cells[-3]
+        )
+
+        if (
+            weight is None
+            or
+            market_value is None
+            or
+            shares is None
+        ):
             continue
 
-        ticker = clean_text(cells[1])
-        name = clean_text(cells[0])
-        if not ticker or ticker.lower() in {"identifier", "ticker"}:
+        ticker = clean_text(
+            cells[1]
+        )
+
+        name = clean_text(
+            cells[0]
+        )
+
+        if not ticker:
             continue
 
-        rows.append(
+        if ticker.lower() in {
+            "identifier",
+            "ticker",
+        }:
+            continue
+
+        records.append(
             {
                 "raw_ticker": ticker,
                 "raw_name": name,
                 "weight": weight,
                 "shares": shares,
-                "market_value": mval,
+                "market_value": (
+                    market_value
+                ),
                 "isin": "",
                 "sedol": "",
             }
         )
 
-    if not rows:
-        raise HoldingsError("no First Trust holdings rows found in DOM")
+    if not records:
 
-    return pd.DataFrame(rows, columns=STD_COLS)
-
-
-def parse_downloaded_holdings(
-    response: requests.Response,
-    *,
-    provider: str,
-    source_date_hint: str | None = None,
-) -> tuple[pd.DataFrame, str | None]:
-    """Parse a provider download as CSV or Excel using flexible column names."""
-    ctype = response.headers.get("content-type", "").lower()
-    final_url = str(response.url).lower()
-
-    if (
-        "spreadsheet" in ctype
-        or "excel" in ctype
-        or final_url.endswith((".xls", ".xlsx"))
-        or response.content[:2] == b"PK"
-    ):
-        df, source_date = excel_with_detected_header(
-            response.content,
-            required_tokens=("ticker",),
+        raise HoldingsError(
+            "GRID: no First Trust "
+            "holdings rows found"
         )
-        return df, source_date or source_date_hint
 
-    text = response.text
-    if "ticker" in text[:10000].lower() and "," in text[:2000]:
-        df, _ = sniff_csv(text, ["ticker"])
-        return df, extract_date_from_text(text[:20000]) or source_date_hint
-
-    raise HoldingsError(
-        f"{provider}: download was neither recognizable CSV nor Excel "
-        f"(content-type={ctype}, final_url={response.url})"
+    return pd.DataFrame(
+        records,
+        columns=STD_COLS,
     )
 
 
-# ---------------------------------------------------------------------------
-# PROVIDER FETCHERS
-# ---------------------------------------------------------------------------
-
-def fetch_ssga(
-    session: requests.Session, etf: str, timeout: int
+def fetch_firsttrust(
+    session: requests.Session,
+    etf: str,
+    timeout: int,
 ) -> FetchResult:
-    url = SSGA_URL.format(t=etf.lower())
-    r = http_get(session, url, timeout)
 
-    raw = pd.read_excel(io.BytesIO(r.content), header=None, dtype=str)
-    hdr = None
-    for i in range(min(20, len(raw))):
-        vals = " ".join(clean_text(v).lower() for v in raw.iloc[i].tolist())
-        if "ticker" in vals and "weight" in vals:
-            hdr = i
-            break
-    if hdr is None:
-        raise HoldingsError(f"{etf}: SSGA holdings header not found")
-
-    source_date = None
-    for i in range(hdr):
-        row_text = " ".join(clean_text(v) for v in raw.iloc[i].tolist())
-        parsed = extract_date_from_text(row_text)
-        if parsed:
-            source_date = parsed
-            break
-
-    df = raw.iloc[hdr + 1 :].copy()
-    df.columns = [clean_text(c) for c in raw.iloc[hdr].tolist()]
-    result = standardise(
-        df,
-        ticker=pick_col(df, ["ticker"]),
-        name=pick_col(df, ["name", "security"]),
-        weight=pick_col(df, ["weight"]),
-        shares=pick_col(df, ["shares held", "shares"]),
-        mval=pick_col(df, ["market value"]),
-        isin=pick_col(df, ["isin"]),
-        sedol=pick_col(df, ["sedol"]),
-    )
-    result = drop_nonsecurity_rows(result)
-    result, precision = maybe_recompute_from_market_value(result)
-    return FetchResult(result, source_date or iso_today(), precision)
-
-
-def fetch_ishares(
-    session: requests.Session, etf: str, timeout: int
-) -> FetchResult:
-    _, r = try_urls(session, ISHARES_ACWI_URLS, timeout)
-    text = r.text
-    df, _ = sniff_csv(text, ["ticker", "name", "weight"])
-
-    ticker_col = pick_col(df, ["ticker"])
-    exchange_col = pick_col(df, ["exchange"])
-    if ticker_col and exchange_col:
-        df = df.copy()
-        df[ticker_col] = [
-            qualify_ishares_ticker(t, ex)
-            for t, ex in zip(df[ticker_col], df[exchange_col])
-        ]
-
-    result_all = standardise(
-        df,
-        ticker=ticker_col,
-        name=pick_col(df, ["name"]),
-        weight=pick_col(df, ["weight"]),
-        shares=pick_col(df, ["quantity", "shares"]),
-        mval=pick_col(df, ["market value"]),
-        isin=pick_col(df, ["isin"]),
-        sedol=pick_col(df, ["sedol"]),
+    url = FIRSTTRUST_URL.format(
+        ticker=etf
     )
 
-    # Recompute before removing cash/FX so the denominator remains the provider's
-    # full portfolio value rather than an equity-only renormalisation.
-    result_all, precision = maybe_recompute_from_market_value(result_all)
-    result = drop_nonsecurity_rows(result_all)
+    response = http_get(
+        session,
+        url,
+        timeout,
+    )
+
+    source_date = (
+        extract_date_from_text(
+            response.text[:50000]
+        )
+        or iso_today()
+    )
+
+    result_all = (
+        parse_firsttrust_dom(
+            response.text
+        )
+    )
+
+    result_all, precision = (
+        maybe_recompute_from_market_value(
+            result_all
+        )
+    )
+
+    result = drop_nonsecurity_rows(
+        result_all
+    )
 
     return FetchResult(
         result,
-        extract_date_from_text(text[:20000]) or iso_today(),
+        source_date,
         precision,
     )
 
 
-def fetch_invesco(
-    session: requests.Session, etf: str, timeout: int
-) -> FetchResult:
-    """Best-effort official Invesco export.
-
-    Invesco's portfolio table is dynamically loaded and its legacy CSV endpoint
-    currently returns 406 on some hosts. We first visit the official SOXQ page
-    to establish cookies, then retry the export with browser-like download
-    headers. If Invesco still rejects it, the pipeline uses last-known-good.
-    """
-    page = http_get(session, INVESCO_PAGE_URL, timeout)
-    source_date = extract_date_from_text(page.text[:50000]) or iso_today()
-
-    # If Invesco exposes a real downloadable link in the page, prefer it.
-    discovered = find_download_link(
-        page.text,
-        page.url,
-        text_contains=("export",),
-    )
-    candidates = []
-    if discovered:
-        candidates.append(discovered)
-    candidates.extend(u.format(t=etf) for u in INVESCO_URLS)
-
-    errors: list[str] = []
-    for url in dict.fromkeys(candidates):
-        try:
-            headers = {
-                "Referer": INVESCO_PAGE_URL,
-                "Accept": (
-                    "text/csv,application/csv,application/vnd.ms-excel,"
-                    "application/octet-stream;q=0.9,*/*;q=0.8"
-                ),
-            }
-            r = session.get(
-                url,
-                headers=headers,
-                timeout=(10, timeout),
-                allow_redirects=True,
-            )
-            if r.status_code != 200 or len(r.content) < 100:
-                raise HoldingsError(
-                    f"HTTP {r.status_code}, {len(r.content)} bytes"
-                )
-
-            parsed, dl_date = parse_downloaded_holdings(
-                r,
-                provider="Invesco",
-                source_date_hint=source_date,
-            )
-            result_all = standardise(
-                parsed,
-                ticker=pick_col(parsed, ["holding ticker", "ticker", "symbol"]),
-                name=pick_col(parsed, ["name", "security", "holding"]),
-                weight=pick_col(parsed, ["weight", "%"]),
-                shares=pick_col(parsed, ["shares", "quantity"]),
-                mval=pick_col(parsed, ["market value", "marketvalue"]),
-                isin=pick_col(parsed, ["isin", "security identifier"]),
-                sedol=pick_col(parsed, ["sedol"]),
-            )
-            result_all, precision = maybe_recompute_from_market_value(result_all)
-            result = drop_nonsecurity_rows(result_all)
-            return FetchResult(result, dl_date or source_date, precision)
-        except Exception as exc:
-            errors.append(f"{url}: {exc}")
-
-    raise HoldingsError(" | ".join(errors))
-
-
-def fetch_globalx(
-    session: requests.Session, etf: str, timeout: int
-) -> FetchResult:
-    page_url = GLOBALX_PAGE_URL.format(t=etf.upper())
-    page = http_get(session, page_url, timeout)
-    source_date = extract_date_from_text(page.text[:50000]) or iso_today()
-
-    csv_url = find_download_link(
-        page.text,
-        page.url,
-        text_contains=("full holdings",),
-        href_contains=(".csv",),
-    )
-    if not csv_url:
-        # Some page versions have no visible text on the anchor; fall back to
-        # any CSV link that contains the fund ticker or "holding".
-        try:
-            root = lxml_html.fromstring(page.text)
-            links = []
-            for a in root.xpath("//a[@href]"):
-                href = clean_text(a.get("href"))
-                low = href.lower()
-                if ".csv" not in low:
-                    continue
-                score = 0
-                if etf.lower() in low:
-                    score += 3
-                if "holding" in low:
-                    score += 2
-                links.append((score, urljoin(page.url, href)))
-            if links:
-                links.sort(key=lambda x: x[0], reverse=True)
-                csv_url = links[0][1]
-        except Exception:
-            pass
-
-    if not csv_url:
-        raise HoldingsError(f"{etf}: Full Holdings CSV link not found")
-
-    r = http_get(session, csv_url, timeout)
-    parsed, dl_date = parse_downloaded_holdings(
-        r,
-        provider="Global X",
-        source_date_hint=source_date,
-    )
-
-    result_all = standardise(
-        parsed,
-        ticker=pick_col(parsed, ["ticker"]),
-        name=pick_col(parsed, ["name"]),
-        weight=pick_col(parsed, ["% of net assets", "net assets", "weight"]),
-        shares=pick_col(parsed, ["shares held", "shares", "quantity"]),
-        mval=pick_col(parsed, ["market value"]),
-        isin=pick_col(parsed, ["isin"]),
-        sedol=pick_col(parsed, ["sedol"]),
-    )
-    result_all, precision = maybe_recompute_from_market_value(result_all)
-    result = drop_nonsecurity_rows(result_all)
-
-    return FetchResult(result, dl_date or source_date, precision)
-
-
-def fetch_firsttrust(
-    session: requests.Session, etf: str, timeout: int
-) -> FetchResult:
-    urls = [u.format(t=etf) for u in FIRSTTRUST_URLS]
-    _, page = try_urls(session, urls, timeout)
-    source_date = extract_date_from_text(page.text[:50000]) or iso_today()
-
-    errors: list[str] = []
-
-    # First Trust's holdings are present in the page DOM, but the table markup
-    # is not reliably recognized by pandas.read_html. Parse row cells directly.
-    try:
-        result_all = parse_firsttrust_dom(page.text)
-        result_all, precision = maybe_recompute_from_market_value(result_all)
-        result = drop_nonsecurity_rows(result_all)
-        if len(result) >= MIN_HOLDINGS_BY_TICKER[etf]:
-            return FetchResult(result, source_date, precision)
-        errors.append(f"DOM parser returned only {len(result)} rows")
-    except Exception as exc:
-        errors.append(f"DOM parser: {exc}")
-
-    # Secondary path: follow any actual Excel/export link exposed in the page.
-    export_url = (
-        find_download_link(
-            page.text,
-            page.url,
-            text_contains=("export", "excel"),
-        )
-        or find_download_link(
-            page.text,
-            page.url,
-            href_contains=("excel",),
-        )
-    )
-    if export_url:
-        try:
-            r = http_get(session, export_url, timeout)
-            parsed, dl_date = parse_downloaded_holdings(
-                r,
-                provider="First Trust",
-                source_date_hint=source_date,
-            )
-            result_all = standardise(
-                parsed,
-                ticker=pick_col(parsed, ["identifier", "ticker", "symbol"]),
-                name=pick_col(parsed, ["security name", "security", "name"]),
-                weight=pick_col(parsed, ["weighting", "weight", "%"]),
-                shares=pick_col(parsed, ["shares", "quantity"]),
-                mval=pick_col(parsed, ["market value"]),
-                isin=pick_col(parsed, ["isin"]),
-                sedol=pick_col(parsed, ["sedol"]),
-            )
-            result_all, precision = maybe_recompute_from_market_value(result_all)
-            result = drop_nonsecurity_rows(result_all)
-            return FetchResult(result, dl_date or source_date, precision)
-        except Exception as exc:
-            errors.append(f"export parser: {exc}")
-
-    raise HoldingsError(f"{etf}: " + " | ".join(errors))
-
+# ============================================================
+# VANECK / PPH
+# ============================================================
 
 def fetch_vaneck(
-    session: requests.Session, etf: str, timeout: int
+    session: requests.Session,
+    etf: str,
+    timeout: int,
 ) -> FetchResult:
-    page = http_get(session, VANECK_PAGE_URL, timeout)
-    source_date = extract_date_from_text(page.text[:50000]) or iso_today()
+    """
+    Fetch PPH from VanEck.
+
+    First choice:
+      official XLS endpoint behind "Download XLS"
+
+    Second choice:
+      discover the download link from the official holdings page
+    """
+
     errors: list[str] = []
 
-    # VanEck's official page exposes a "Download XLS" control. Resolve that link
-    # dynamically so future filename/date changes do not require code edits.
-    xls_url = (
-        find_download_link(
-            page.text,
-            page.url,
-            text_contains=("download", "xls"),
-        )
-        or find_download_link(
-            page.text,
-            page.url,
-            href_contains=(".xls",),
-        )
-    )
-    if xls_url:
-        try:
-            r = http_get(session, xls_url, timeout)
-            parsed, dl_date = parse_downloaded_holdings(
-                r,
-                provider="VanEck",
-                source_date_hint=source_date,
-            )
-            result_all = standardise(
-                parsed,
-                ticker=pick_col(parsed, ["ticker", "symbol"]),
-                name=pick_col(parsed, ["holding name", "name", "holding", "security"]),
-                weight=pick_col(parsed, ["% of net assets", "% of net", "weight"]),
-                shares=pick_col(parsed, ["shares", "quantity"]),
-                mval=pick_col(parsed, ["market value"]),
-                isin=pick_col(parsed, ["isin"]),
-                sedol=pick_col(parsed, ["sedol"]),
-            )
-            result_all, precision = maybe_recompute_from_market_value(result_all)
-            result = drop_nonsecurity_rows(result_all)
-            return FetchResult(result, dl_date or source_date, precision)
-        except Exception as exc:
-            errors.append(f"XLS parser: {exc}")
+    source_date = iso_today()
 
-    # HTML fallback for page versions where the link is generated client-side.
+    # --------------------------------------------------------
+    # 1. Direct official XLS endpoint
+    # --------------------------------------------------------
+
     try:
-        tables = pd.read_html(io.StringIO(page.text))
-        candidates = [
-            t for t in tables
-            if len(t) >= 20
-            and any(
-                "weight" in clean_text(c).lower()
-                or "% of net" in clean_text(c).lower()
-                for c in t.columns
+
+        response = http_get(
+            session,
+            VANECK_HOLDINGS_XLSX_URL,
+            timeout,
+            headers={
+                "Referer": VANECK_PAGE_URL,
+                "Accept": (
+                    "application/vnd.openxmlformats-"
+                    "officedocument.spreadsheetml.sheet,"
+                    "application/vnd.ms-excel,"
+                    "application/octet-stream;q=0.9,"
+                    "*/*;q=0.8"
+                ),
+            },
+        )
+
+        frame, download_date = (
+            parse_downloaded_holdings(
+                response,
+                provider="VanEck",
+                source_date_hint=(
+                    source_date
+                ),
             )
-        ]
-        if not candidates:
-            raise HoldingsError("no holdings table")
-        best = max(candidates, key=len).copy()
-        best.columns = [clean_text(c) for c in best.columns]
-        parsed = best.astype(str)
+        )
 
         result_all = standardise(
-            parsed,
-            ticker=pick_col(parsed, ["ticker", "symbol"]),
-            name=pick_col(parsed, ["holding name", "name", "holding", "security"]),
-            weight=pick_col(parsed, ["% of net assets", "% of net", "weight", "%"]),
-            shares=pick_col(parsed, ["shares", "quantity"]),
-            mval=pick_col(parsed, ["market value"]),
-            isin=pick_col(parsed, ["isin"]),
-            sedol=pick_col(parsed, ["sedol"]),
+            frame,
+            ticker=pick_col(
+                frame,
+                [
+                    "ticker",
+                    "symbol",
+                ],
+            ),
+            name=pick_col(
+                frame,
+                [
+                    "holding name",
+                    "name",
+                    "holding",
+                    "security",
+                ],
+            ),
+            weight=pick_col(
+                frame,
+                [
+                    "% of net assets",
+                    "% of net",
+                    "weight",
+                ],
+            ),
+            shares=pick_col(
+                frame,
+                [
+                    "shares",
+                    "quantity",
+                ],
+            ),
+            mval=pick_col(
+                frame,
+                [
+                    "market value",
+                ],
+            ),
+            isin=pick_col(
+                frame,
+                ["isin"],
+            ),
+            sedol=pick_col(
+                frame,
+                ["sedol"],
+            ),
         )
-        result_all, precision = maybe_recompute_from_market_value(result_all)
-        result = drop_nonsecurity_rows(result_all)
-        return FetchResult(result, source_date, precision)
+
+        result_all, precision = (
+            maybe_recompute_from_market_value(
+                result_all
+            )
+        )
+
+        result = drop_nonsecurity_rows(
+            result_all
+        )
+
+        return FetchResult(
+            result,
+            download_date
+            or source_date,
+            precision,
+        )
+
     except Exception as exc:
-        errors.append(f"HTML parser: {exc}")
 
-    raise HoldingsError(f"{etf}: " + " | ".join(errors))
+        errors.append(
+            f"direct XLSX: {exc}"
+        )
+
+    # --------------------------------------------------------
+    # 2. Discover current XLS link from official page
+    # --------------------------------------------------------
+
+    try:
+
+        page = http_get(
+            session,
+            VANECK_PAGE_URL,
+            timeout,
+        )
+
+        source_date = (
+            extract_date_from_text(
+                page.text[:50000]
+            )
+            or source_date
+        )
+
+        download_url = (
+            find_download_link(
+                page.text,
+                page.url,
+                text_contains=(
+                    "download",
+                    "xls",
+                ),
+            )
+            or
+            find_download_link(
+                page.text,
+                page.url,
+                href_contains=(
+                    "downloads",
+                    "holdings",
+                ),
+            )
+            or
+            find_download_link(
+                page.text,
+                page.url,
+                href_contains=(
+                    ".xls",
+                ),
+            )
+        )
+
+        if not download_url:
+
+            raise HoldingsError(
+                "Download XLS link "
+                "not found"
+            )
+
+        response = http_get(
+            session,
+            download_url,
+            timeout,
+            headers={
+                "Referer": (
+                    VANECK_PAGE_URL
+                )
+            },
+        )
+
+        frame, download_date = (
+            parse_downloaded_holdings(
+                response,
+                provider="VanEck",
+                source_date_hint=(
+                    source_date
+                ),
+            )
+        )
+
+        result_all = standardise(
+            frame,
+            ticker=pick_col(
+                frame,
+                [
+                    "ticker",
+                    "symbol",
+                ],
+            ),
+            name=pick_col(
+                frame,
+                [
+                    "holding name",
+                    "name",
+                    "holding",
+                    "security",
+                ],
+            ),
+            weight=pick_col(
+                frame,
+                [
+                    "% of net assets",
+                    "% of net",
+                    "weight",
+                ],
+            ),
+            shares=pick_col(
+                frame,
+                [
+                    "shares",
+                    "quantity",
+                ],
+            ),
+            mval=pick_col(
+                frame,
+                ["market value"],
+            ),
+            isin=pick_col(
+                frame,
+                ["isin"],
+            ),
+            sedol=pick_col(
+                frame,
+                ["sedol"],
+            ),
+        )
+
+        result_all, precision = (
+            maybe_recompute_from_market_value(
+                result_all
+            )
+        )
+
+        result = drop_nonsecurity_rows(
+            result_all
+        )
+
+        return FetchResult(
+            result,
+            download_date
+            or source_date,
+            precision,
+        )
+
+    except Exception as exc:
+
+        errors.append(
+            "page discovery: "
+            f"{exc}"
+        )
+
+    raise HoldingsError(
+        f"{etf}: "
+        + " | ".join(errors)
+    )
 
 
-def _walk_dict_lists(value: Any):
-    if isinstance(value, list):
-        if value and all(isinstance(item, dict) for item in value):
+# ============================================================
+# INVESCO / SOXQ
+# ============================================================
+
+def fetch_invesco(
+    session: requests.Session,
+    etf: str,
+    timeout: int,
+) -> FetchResult:
+    """
+    Best-effort official Invesco route.
+
+    Invesco may return HTTP 406 to automation.
+
+    IMPORTANT:
+    A failed product-page request must NOT prevent the
+    direct official export URL being attempted.
+
+    If both official routes fail, this function raises and
+    the main pipeline uses cleaned last-known-good SOXQ rows.
+    """
+
+    errors: list[str] = []
+
+    source_date = iso_today()
+
+    candidates: list[str] = []
+
+    # --------------------------------------------------------
+    # Product page / link discovery
+    # --------------------------------------------------------
+
+    try:
+
+        page = session.get(
+            INVESCO_PAGE_URL,
+            headers={
+                **HEADERS,
+                "Accept": (
+                    "text/html,"
+                    "application/xhtml+xml,"
+                    "application/xml;q=0.9,"
+                    "*/*;q=0.8"
+                ),
+            },
+            timeout=(
+                10,
+                timeout,
+            ),
+            allow_redirects=True,
+        )
+
+        if (
+            page.status_code == 200
+            and
+            len(page.content) >= 100
+        ):
+
+            source_date = (
+                extract_date_from_text(
+                    page.text[:50000]
+                )
+                or source_date
+            )
+
+            discovered = (
+                find_download_link(
+                    page.text,
+                    page.url,
+                    text_contains=(
+                        "export",
+                    ),
+                )
+            )
+
+            if discovered:
+                candidates.append(
+                    discovered
+                )
+
+        else:
+
+            errors.append(
+                "product page "
+                f"HTTP {page.status_code}"
+            )
+
+    except Exception as exc:
+
+        errors.append(
+            f"product page: {exc}"
+        )
+
+    # Direct official legacy export path.
+    candidates.append(
+        INVESCO_EXPORT_URL.format(
+            ticker=etf
+        )
+    )
+
+    # --------------------------------------------------------
+    # Try candidates
+    # --------------------------------------------------------
+
+    for url in dict.fromkeys(
+        candidates
+    ):
+
+        try:
+
+            response = session.get(
+                url,
+                headers={
+                    **HEADERS,
+                    "Referer": (
+                        INVESCO_PAGE_URL
+                    ),
+                    "Accept": (
+                        "text/csv,"
+                        "application/csv,"
+                        "application/vnd.ms-excel,"
+                        "application/vnd.openxmlformats-"
+                        "officedocument.spreadsheetml.sheet,"
+                        "application/octet-stream;q=0.9,"
+                        "*/*;q=0.8"
+                    ),
+                },
+                timeout=(
+                    10,
+                    timeout,
+                ),
+                allow_redirects=True,
+            )
+
+            if (
+                response.status_code
+                != 200
+            ):
+
+                raise HoldingsError(
+                    "HTTP "
+                    f"{response.status_code}"
+                )
+
+            if len(
+                response.content
+            ) < 100:
+
+                raise HoldingsError(
+                    "response too small"
+                )
+
+            frame, download_date = (
+                parse_downloaded_holdings(
+                    response,
+                    provider="Invesco",
+                    source_date_hint=(
+                        source_date
+                    ),
+                )
+            )
+
+            result_all = standardise(
+                frame,
+                ticker=pick_col(
+                    frame,
+                    [
+                        "ticker",
+                        "symbol",
+                    ],
+                ),
+                name=pick_col(
+                    frame,
+                    [
+                        "holding name",
+                        "name",
+                        "security",
+                        "description",
+                    ],
+                ),
+                weight=pick_col(
+                    frame,
+                    [
+                        "weight",
+                        "% of fund",
+                        "% of net",
+                    ],
+                ),
+                shares=pick_col(
+                    frame,
+                    [
+                        "shares",
+                        "quantity",
+                    ],
+                ),
+                mval=pick_col(
+                    frame,
+                    ["market value"],
+                ),
+                isin=pick_col(
+                    frame,
+                    ["isin"],
+                ),
+                sedol=pick_col(
+                    frame,
+                    ["sedol"],
+                ),
+            )
+
+            result_all, precision = (
+                maybe_recompute_from_market_value(
+                    result_all
+                )
+            )
+
+            result = (
+                drop_nonsecurity_rows(
+                    result_all
+                )
+            )
+
+            return FetchResult(
+                result,
+                download_date
+                or source_date,
+                precision,
+            )
+
+        except Exception as exc:
+
+            errors.append(
+                f"{url}: {exc}"
+            )
+
+    raise HoldingsError(
+        f"{etf}: official Invesco "
+        "routes unavailable: "
+        + " | ".join(
+            errors[-6:]
+        )
+    )
+
+
+# ============================================================
+# VANGUARD JSON
+# ============================================================
+
+def walk_dict_lists(
+    value: Any,
+):
+
+    if isinstance(
+        value,
+        list,
+    ):
+
+        if (
+            value
+            and
+            all(
+                isinstance(
+                    item,
+                    dict,
+                )
+                for item
+                in value
+            )
+        ):
+
             yield value
+
         for item in value:
-            yield from _walk_dict_lists(item)
-    elif isinstance(value, dict):
-        for item in value.values():
-            yield from _walk_dict_lists(item)
+
+            yield from walk_dict_lists(
+                item
+            )
+
+    elif isinstance(
+        value,
+        dict,
+    ):
+
+        for item in (
+            value.values()
+        ):
+
+            yield from walk_dict_lists(
+                item
+            )
 
 
-def _score_vanguard_list(rows: list[dict[str, Any]]) -> int:
+def score_vanguard_rows(
+    rows: list[
+        dict[str, Any]
+    ],
+) -> int:
+
     score = 0
+
     for row in rows[:20]:
-        keys = {str(k).lower() for k in row}
-        if any(k in keys for k in {"ticker", "tickersymbol", "symbol"}):
+
+        keys = {
+            str(key).lower()
+            for key
+            in row
+        }
+
+        if (
+            "ticker" in keys
+            or
+            "tickersymbol" in keys
+            or
+            "symbol" in keys
+        ):
             score += 3
-        if any(k in keys for k in {"sharesheld", "shares", "quantity"}):
+
+        if (
+            "sharesheld" in keys
+            or
+            "shares" in keys
+            or
+            "quantity" in keys
+        ):
             score += 3
-        if any(k in keys for k in {"marketvalue", "marketval"}):
+
+        if (
+            "marketvalue" in keys
+            or
+            "marketval" in keys
+        ):
             score += 2
-        if any(k in keys for k in {"longname", "shortname", "name"}):
+
+        if (
+            "longname" in keys
+            or
+            "shortname" in keys
+            or
+            "name" in keys
+        ):
             score += 1
+
     return score
 
 
+def recursive_find_date(
+    payload: Any,
+) -> str | None:
+
+    date_keys = {
+        "asofdate",
+        "as_of_date",
+        "asof",
+        "effectivedate",
+        "effective_date",
+        "portfoliodate",
+        "portfolio_date",
+        "date",
+    }
+
+    stack = [
+        payload
+    ]
+
+    while stack:
+
+        item = stack.pop()
+
+        if isinstance(
+            item,
+            dict,
+        ):
+
+            for key, value in (
+                item.items()
+            ):
+
+                if (
+                    str(key)
+                    .lower()
+                    in date_keys
+                ):
+
+                    parsed = (
+                        normalize_date_value(
+                            value
+                        )
+                    )
+
+                    if parsed:
+                        return parsed
+
+            stack.extend(
+                item.values()
+            )
+
+        elif isinstance(
+            item,
+            list,
+        ):
+
+            stack.extend(
+                item
+            )
+
+    return None
+
+
 def fetch_vanguard(
-    session: requests.Session, etf: str, timeout: int
+    session: requests.Session,
+    etf: str,
+    timeout: int,
 ) -> FetchResult:
-    urls = [u.format(t=etf.lower()) for u in VANGUARD_URLS]
-    _, r = try_urls(session, urls, timeout)
+
+    url = (
+        VANGUARD_URL
+        .format(
+            ticker=etf.lower()
+        )
+    )
+
+    response = http_get(
+        session,
+        url,
+        timeout,
+    )
 
     try:
-        payload = r.json()
+
+        payload = response.json()
+
     except json.JSONDecodeError as exc:
-        raise HoldingsError(f"{etf}: Vanguard response was not JSON: {exc}") from exc
 
-    candidates = list(_walk_dict_lists(payload))
-    if not candidates:
-        raise HoldingsError(f"{etf}: no holdings list found in Vanguard JSON")
+        raise HoldingsError(
+            f"{etf}: Vanguard "
+            "response was not JSON"
+        ) from exc
 
-    entities = max(candidates, key=_score_vanguard_list)
-    if _score_vanguard_list(entities) <= 0:
-        raise HoldingsError(f"{etf}: Vanguard JSON did not contain recognizable holdings")
+    candidate_lists = list(
+        walk_dict_lists(
+            payload
+        )
+    )
 
-    rows: list[dict[str, Any]] = []
-    for e in entities:
-        rows.append(
+    if not candidate_lists:
+
+        raise HoldingsError(
+            f"{etf}: no Vanguard "
+            "holdings list found"
+        )
+
+    entities = max(
+        candidate_lists,
+        key=score_vanguard_rows,
+    )
+
+    if score_vanguard_rows(
+        entities
+    ) <= 0:
+
+        raise HoldingsError(
+            f"{etf}: Vanguard holdings "
+            "schema not recognised"
+        )
+
+    records: list[
+        dict[str, Any]
+    ] = []
+
+    for entity in entities:
+
+        ticker = clean_text(
+            entity.get("ticker")
+            or
+            entity.get(
+                "tickerSymbol"
+            )
+            or
+            entity.get("symbol")
+            or
+            ""
+        )
+
+        name = clean_text(
+            entity.get(
+                "longName"
+            )
+            or
+            entity.get(
+                "shortName"
+            )
+            or
+            entity.get("name")
+            or
+            entity.get(
+                "securityName"
+            )
+            or
+            ""
+        )
+
+        weight = to_float(
+            entity.get(
+                "percentWeight"
+            )
+            or
+            entity.get("weight")
+            or
+            entity.get("percent")
+        )
+
+        shares = to_float(
+            entity.get(
+                "sharesHeld"
+            )
+            or
+            entity.get("shares")
+            or
+            entity.get(
+                "quantity"
+            )
+        )
+
+        market_value = to_float(
+            entity.get(
+                "marketValue"
+            )
+            or
+            entity.get(
+                "marketVal"
+            )
+            or
+            entity.get("value")
+        )
+
+        isin = clean_text(
+            entity.get("isin")
+            or
+            ""
+        )
+
+        sedol = clean_text(
+            entity.get("sedol")
+            or
+            ""
+        )
+
+        records.append(
             {
-                "raw_ticker": clean_text(
-                    e.get("ticker")
-                    or e.get("tickerSymbol")
-                    or e.get("symbol")
-                    or ""
+                "raw_ticker": ticker,
+                "raw_name": name,
+                "weight": weight,
+                "shares": shares,
+                "market_value": (
+                    market_value
                 ),
-                "raw_name": clean_text(
-                    e.get("longName")
-                    or e.get("shortName")
-                    or e.get("name")
-                    or e.get("securityName")
-                    or ""
-                ),
-                "weight": to_float(
-                    e.get("percentWeight")
-                    or e.get("weight")
-                    or e.get("percent")
-                ),
-                "shares": to_float(
-                    e.get("sharesHeld")
-                    or e.get("shares")
-                    or e.get("quantity")
-                ),
-                "market_value": to_float(
-                    e.get("marketValue")
-                    or e.get("marketVal")
-                    or e.get("value")
-                ),
-                "isin": clean_text(e.get("isin") or ""),
-                "sedol": clean_text(e.get("sedol") or ""),
+                "isin": isin,
+                "sedol": sedol,
             }
         )
 
-    result = pd.DataFrame(rows, columns=STD_COLS)
-    result = drop_nonsecurity_rows(result)
-    source_date = recursive_find_date(payload) or iso_today()
+    result = pd.DataFrame(
+        records,
+        columns=STD_COLS,
+    )
 
-    # Do not recompute from Vanguard snapshot market values here. VGT is
-    # intentionally drifted to current prices below.
-    return FetchResult(result, source_date, "vanguard_snapshot")
+    result = drop_nonsecurity_rows(
+        result
+    )
 
+    source_date = (
+        recursive_find_date(
+            payload
+        )
+        or iso_today()
+    )
 
-# ---------------------------------------------------------------------------
-# VGT DRIFTING
-# ---------------------------------------------------------------------------
-
-def yahoo_ticker(raw_ticker: str) -> str:
-    """Convert common US provider tickers into Yahoo syntax.
-
-    Preserve exchange suffixes such as 2330.TW. Convert class-share dots for US
-    tickers such as BRK.B -> BRK-B.
-    """
-    s = clean_text(raw_ticker).upper()
-    s = re.sub(r"\s+(US|UN|UW|UQ|UR|UF)$", "", s)
-
-    # A dot followed by 1-4 letters at the end is probably an exchange suffix
-    # (e.g. .TW, .KS). Keep it. Otherwise treat the dot as a US share-class
-    # separator for Yahoo.
-    if re.fullmatch(r"[A-Z0-9]+\.([A-Z]{1,4})", s):
-        suffix = s.rsplit(".", 1)[1]
-        if suffix in {"TW", "KS", "L", "PA", "AS", "DE", "SW", "TO", "HK", "T"}:
-            return s
-    return s.replace("/", "-").replace(".", "-")
+    return FetchResult(
+        result,
+        source_date,
+        "vanguard_snapshot",
+    )
 
 
-def _field_frame(data: pd.DataFrame, field: str, tickers: list[str]) -> pd.DataFrame:
-    """Extract one yfinance field into a ticker-column DataFrame."""
-    if isinstance(data.columns, pd.MultiIndex):
-        if field not in data.columns.get_level_values(0):
-            return pd.DataFrame(index=data.index)
-        frame = data[field]
-        if isinstance(frame, pd.Series):
-            frame = frame.to_frame(tickers[0] if tickers else field)
-        return frame
-
-    if field not in data.columns:
-        return pd.DataFrame(index=data.index)
-
-    series = data[field]
-    if isinstance(series, pd.Series):
-        name = tickers[0] if len(tickers) == 1 else field
-        return series.to_frame(name)
-    return series
-
+# ============================================================
+# VGT DRIFT
+# ============================================================
 
 def drift_vgt_with_yahoo(
-    df: pd.DataFrame,
+    frame: pd.DataFrame,
     snapshot_date: str,
 ) -> pd.DataFrame:
-    """Recompute VGT weights from snapshot shares x current prices.
 
-    Split handling:
-      shares_today = snapshot_shares * product(stock_split_ratios_after_snapshot)
-
-    Missing-price policy:
-      * never assign a material security a value of zero;
-      * tiny unpriced tails may retain their Vanguard snapshot market value;
-      * if the total snapshot weight of fallbacks exceeds 5 bps, fail the live
-        VGT pull and fall back to the prior validated CSV instead.
-    """
     import yfinance as yf
 
-    out = df.copy()
-    if out.empty:
-        raise HoldingsError("VGT: Vanguard returned no holdings")
+    output = frame.copy()
 
-    snapshot_dt = datetime.fromisoformat(snapshot_date).date()
-    start = (snapshot_dt - timedelta(days=3)).isoformat()
+    if output.empty:
 
-    out["_yf"] = out["raw_ticker"].map(yahoo_ticker)
-    tickers = sorted({t for t in out["_yf"] if t})
-    if not tickers:
-        raise HoldingsError("VGT: no Yahoo-priceable tickers")
-
-    print(f"[VGT] Pricing {len(tickers)} securities via Yahoo...", file=sys.stderr)
+        raise HoldingsError(
+            "VGT: Vanguard returned "
+            "no holdings"
+        )
 
     try:
-        hist = yf.download(
-            tickers=tickers,
-            start=start,
+
+        snapshot_day = (
+            datetime
+            .fromisoformat(
+                snapshot_date
+            )
+            .date()
+        )
+
+    except ValueError:
+
+        snapshot_day = (
+            utc_now()
+            .date()
+        )
+
+    start_date = (
+        snapshot_day
+        - timedelta(days=3)
+    ).isoformat()
+
+    output["_yahoo"] = (
+        output[
+            "raw_ticker"
+        ]
+        .map(
+            yahoo_ticker
+        )
+    )
+
+    symbols = sorted(
+        {
+            symbol
+            for symbol
+            in output["_yahoo"]
+            if symbol
+        }
+    )
+
+    if not symbols:
+
+        raise HoldingsError(
+            "VGT: no Yahoo-priceable "
+            "tickers"
+        )
+
+    print(
+        "[VGT] Pricing "
+        f"{len(symbols)} securities "
+        "via Yahoo...",
+        file=sys.stderr,
+    )
+
+    try:
+
+        history = yf.download(
+            tickers=symbols,
+            start=start_date,
             interval="1d",
             actions=True,
             auto_adjust=False,
@@ -1254,108 +3263,327 @@ def drift_vgt_with_yahoo(
             timeout=15,
             group_by="column",
         )
+
     except Exception as exc:
-        raise HoldingsError(f"VGT: Yahoo bulk download failed: {exc}") from exc
 
-    if hist is None or len(hist) == 0:
-        raise HoldingsError("VGT: Yahoo returned no price history")
+        raise HoldingsError(
+            "VGT: Yahoo bulk "
+            f"download failed: {exc}"
+        ) from exc
 
-    closes = _field_frame(hist, "Close", tickers)
-    splits = _field_frame(hist, "Stock Splits", tickers)
+    if (
+        history is None
+        or
+        len(history) == 0
+    ):
 
-    latest_price: dict[str, float] = {}
-    split_factor: dict[str, float] = {}
+        raise HoldingsError(
+            "VGT: Yahoo returned "
+            "no price history"
+        )
 
-    for t in tickers:
-        if t in closes.columns:
-            series = pd.to_numeric(closes[t], errors="coerce").dropna()
+    closes = _field_frame(
+        history,
+        "Close",
+        symbols,
+    )
+
+    splits = _field_frame(
+        history,
+        "Stock Splits",
+        symbols,
+    )
+
+    latest_price: dict[
+        str,
+        float,
+    ] = {}
+
+    split_factor: dict[
+        str,
+        float,
+    ] = {}
+
+    for symbol in symbols:
+
+        if symbol in closes.columns:
+
+            series = pd.to_numeric(
+                closes[symbol],
+                errors="coerce",
+            ).dropna()
+
             if not series.empty:
-                latest_price[t] = float(series.iloc[-1])
+
+                latest_price[
+                    symbol
+                ] = float(
+                    series.iloc[-1]
+                )
 
         factor = 1.0
-        if t in splits.columns:
-            s = pd.to_numeric(splits[t], errors="coerce").fillna(0.0)
-            # Split events on/after the snapshot date affect today's share count.
-            for idx, value in s.items():
-                idx_date = pd.Timestamp(idx).date()
-                if idx_date > snapshot_dt and value not in (0, 1) and value > 0:
-                    factor *= float(value)
-        split_factor[t] = factor
 
-    snapshot_mval = pd.to_numeric(out["market_value"], errors="coerce")
-    snapshot_weight = pd.to_numeric(out["weight"], errors="coerce")
+        if symbol in splits.columns:
 
-    # If provider weights are missing but market values are present, reconstruct
-    # snapshot weights solely for missing-price significance checks.
-    if snapshot_weight.notna().sum() < len(out) and snapshot_mval.notna().all():
-        total_snap = float(snapshot_mval.sum())
-        if total_snap > 0:
-            snapshot_weight = snapshot_mval / total_snap * 100.0
+            series = pd.to_numeric(
+                splits[symbol],
+                errors="coerce",
+            ).fillna(0.0)
 
-    live_values: list[float] = []
-    adjusted_shares: list[float | None] = []
+            for index, value in (
+                series.items()
+            ):
+
+                event_day = (
+                    pd.Timestamp(index)
+                    .date()
+                )
+
+                if (
+                    event_day
+                    > snapshot_day
+                    and
+                    value > 0
+                    and
+                    value not in (
+                        0,
+                        1,
+                    )
+                ):
+
+                    factor *= float(
+                        value
+                    )
+
+        split_factor[
+            symbol
+        ] = factor
+
+    snapshot_market_value = (
+        pd.to_numeric(
+            output[
+                "market_value"
+            ],
+            errors="coerce",
+        )
+    )
+
+    snapshot_weight = (
+        pd.to_numeric(
+            output[
+                "weight"
+            ],
+            errors="coerce",
+        )
+    )
+
+    if (
+        snapshot_weight
+        .notna()
+        .sum()
+        < len(output)
+        and
+        snapshot_market_value
+        .notna()
+        .all()
+    ):
+
+        total_snapshot = float(
+            snapshot_market_value
+            .sum()
+        )
+
+        if total_snapshot > 0:
+
+            snapshot_weight = (
+                snapshot_market_value
+                / total_snapshot
+                * 100.0
+            )
+
+    live_values: list[
+        float
+    ] = []
+
+    adjusted_shares: list[
+        float | None
+    ] = []
+
     fallback_weight = 0.0
-    fallback_names: list[str] = []
 
-    for i, row in out.iterrows():
-        t = row["_yf"]
-        shares = to_float(row["shares"])
-        px = latest_price.get(t)
-        factor = split_factor.get(t, 1.0)
+    fallback_names: list[
+        str
+    ] = []
 
-        if shares is not None and shares > 0 and px is not None and px > 0:
-            today_shares = shares * factor
-            live_values.append(today_shares * px)
-            adjusted_shares.append(today_shares)
+    for index, row in (
+        output.iterrows()
+    ):
+
+        symbol = row[
+            "_yahoo"
+        ]
+
+        shares = to_float(
+            row["shares"]
+        )
+
+        price = latest_price.get(
+            symbol
+        )
+
+        factor = split_factor.get(
+            symbol,
+            1.0,
+        )
+
+        if (
+            shares is not None
+            and
+            shares > 0
+            and
+            price is not None
+            and
+            price > 0
+        ):
+
+            current_shares = (
+                shares
+                * factor
+            )
+
+            current_value = (
+                current_shares
+                * price
+            )
+
+            adjusted_shares.append(
+                current_shares
+            )
+
+            live_values.append(
+                current_value
+            )
+
             continue
 
-        mv = to_float(row["market_value"])
-        w = (
-            float(snapshot_weight.iloc[i])
-            if i in snapshot_weight.index and pd.notna(snapshot_weight.iloc[i])
-            else 0.0
+        snapshot_value = to_float(
+            row[
+                "market_value"
+            ]
         )
-        fallback_weight += max(w, 0.0)
-        fallback_names.append(f"{row['raw_ticker']}({w:.4f}%)")
 
-        if mv is None or mv < 0:
-            raise HoldingsError(
-                f"VGT: no live price and no snapshot market value for "
-                f"{row['raw_ticker']} {row['raw_name']}"
+        row_weight = 0.0
+
+        try:
+
+            value = (
+                snapshot_weight
+                .loc[index]
             )
-        live_values.append(mv)
-        adjusted_shares.append(shares)
 
-    if fallback_weight > VGT_MAX_TOTAL_FALLBACK_WEIGHT_PCT:
+            if pd.notna(value):
+
+                row_weight = float(
+                    value
+                )
+
+        except Exception:
+            pass
+
+        fallback_weight += max(
+            row_weight,
+            0.0,
+        )
+
+        fallback_names.append(
+            f"{row['raw_ticker']}"
+            f"({row_weight:.4f}%)"
+        )
+
+        if (
+            snapshot_value is None
+            or
+            snapshot_value < 0
+        ):
+
+            raise HoldingsError(
+                "VGT: no live price and "
+                "no valid snapshot MV for "
+                f"{row['raw_ticker']} "
+                f"{row['raw_name']}"
+            )
+
+        adjusted_shares.append(
+            shares
+        )
+
+        live_values.append(
+            snapshot_value
+        )
+
+    if (
+        fallback_weight
+        >
+        VGT_MAX_TOTAL_FALLBACK_WEIGHT_PCT
+    ):
+
         raise HoldingsError(
-            "VGT: unpriced holdings are too material to drift safely: "
+            "VGT: unpriced holdings too "
+            "material to drift safely: "
             f"{fallback_weight:.4f}% > "
             f"{VGT_MAX_TOTAL_FALLBACK_WEIGHT_PCT:.4f}% "
             f"({', '.join(fallback_names[:10])})"
         )
 
-    total_live = float(sum(live_values))
-    if total_live <= 0:
-        raise HoldingsError("VGT: zero total market value after Yahoo repricing")
+    total_value = float(
+        sum(live_values)
+    )
 
-    out["shares"] = adjusted_shares
-    out["market_value"] = live_values
-    out["weight"] = pd.Series(live_values, index=out.index) / total_live * 100.0
-    out = out.drop(columns=["_yf"])
+    if total_value <= 0:
+
+        raise HoldingsError(
+            "VGT: zero total market value "
+            "after repricing"
+        )
+
+    output["shares"] = (
+        adjusted_shares
+    )
+
+    output["market_value"] = (
+        live_values
+    )
+
+    output["weight"] = (
+        pd.Series(
+            live_values,
+            index=output.index,
+        )
+        / total_value
+        * 100.0
+    )
+
+    output = output.drop(
+        columns=[
+            "_yahoo",
+        ]
+    )
 
     if fallback_names:
+
         print(
-            f"[VGT] Tiny fallback tail retained at snapshot value: "
+            "[VGT] Tiny fallback tail "
+            "retained at snapshot value: "
             f"{fallback_weight:.4f}%",
             file=sys.stderr,
         )
 
-    return out
+    return output
 
 
-# ---------------------------------------------------------------------------
-# IDENTITY / NAMING NORMALISATION
-# ---------------------------------------------------------------------------
+# ============================================================
+# IDENTITY / TICKER COLLISION PROTECTION
+# ============================================================
 
 LEGAL_SUFFIX_PATTERNS = [
     r"\bINCORPORATED\b",
@@ -1376,269 +3604,1055 @@ LEGAL_SUFFIX_PATTERNS = [
 ]
 
 
-def canonical_ticker(raw: str) -> str:
-    s = clean_text(raw).upper()
-    if not s:
+def canonical_ticker(
+    raw: str,
+) -> str:
+
+    ticker = (
+        clean_text(raw)
+        .upper()
+    )
+
+    if not ticker:
         return ""
-    s = re.sub(r"\s+(US|UN|UW|UQ|UR|UF)$", "", s)
-    s = s.replace("/", "-")
-    s = re.sub(r"\s+", "-", s)
-    s = re.sub(r"-+", "-", s)
-    return s.strip("-")
+
+    ticker = re.sub(
+        r"\s+(US|UN|UW|UQ|UR|UF)$",
+        "",
+        ticker,
+    )
+
+    ticker = ticker.replace(
+        "/",
+        "-",
+    )
+
+    ticker = re.sub(
+        r"\s+",
+        "-",
+        ticker,
+    )
+
+    ticker = re.sub(
+        r"-+",
+        "-",
+        ticker,
+    )
+
+    return ticker.strip("-")
 
 
-def normalized_name(raw: str) -> str:
-    s = unicodedata.normalize("NFKD", clean_text(raw))
-    s = s.encode("ascii", "ignore").decode()
-    s = s.upper()
-    s = re.sub(r"[^A-Z0-9& ]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
+def normalized_name(
+    raw: str,
+) -> str:
 
-    # Remove common legal suffixes only from the tail so company identity is not
-    # over-normalised.
+    text = unicodedata.normalize(
+        "NFKD",
+        clean_text(raw),
+    )
+
+    text = (
+        text
+        .encode(
+            "ascii",
+            "ignore",
+        )
+        .decode()
+    )
+
+    text = text.upper()
+
+    text = re.sub(
+        r"[^A-Z0-9& ]+",
+        " ",
+        text,
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    ).strip()
+
     changed = True
-    while changed and s:
+
+    while changed and text:
+
         changed = False
-        for pat in LEGAL_SUFFIX_PATTERNS:
-            new = re.sub(rf"(?:\s+{pat})$", "", s).strip()
-            if new != s:
-                s = new
+
+        for pattern in (
+            LEGAL_SUFFIX_PATTERNS
+        ):
+
+            updated = re.sub(
+                rf"(?:\s+{pattern})$",
+                "",
+                text,
+            ).strip()
+
+            if updated != text:
+
+                text = updated
                 changed = True
-    return s
+
+    return text
 
 
-def valid_isin(value: str) -> bool:
-    return bool(re.fullmatch(r"[A-Z]{2}[A-Z0-9]{9}[0-9]", clean_text(value).upper()))
+def valid_isin(
+    value: str,
+) -> bool:
+
+    return bool(
+        re.fullmatch(
+            r"[A-Z]{2}[A-Z0-9]{9}[0-9]",
+            clean_text(value).upper(),
+        )
+    )
 
 
-def valid_sedol(value: str) -> bool:
-    return bool(re.fullmatch(r"[A-Z0-9]{7}", clean_text(value).upper()))
+def valid_sedol(
+    value: str,
+) -> bool:
+
+    return bool(
+        re.fullmatch(
+            r"[A-Z0-9]{7}",
+            clean_text(value).upper(),
+        )
+    )
 
 
-def assign_identity_keys(long_df: pd.DataFrame) -> pd.DataFrame:
-    df = long_df.copy()
-    df["_ticker"] = df["raw_ticker"].map(canonical_ticker)
-    df["_name_norm"] = df["raw_name"].map(normalized_name)
-    df["_isin"] = df["isin"].map(lambda x: clean_text(x).upper())
-    df["_sedol"] = df["sedol"].map(lambda x: clean_text(x).upper())
+def assign_identity_keys(
+    long_df: pd.DataFrame,
+) -> pd.DataFrame:
 
-    # Build ticker -> strong ID aliases only where the ticker maps to exactly one
-    # ISIN/SEDOL across all providers. This lets a row lacking ISIN inherit the
-    # same identity without blindly trusting globally ambiguous bare tickers.
-    ticker_to_strong: dict[str, set[str]] = {}
-    for _, row in df.iterrows():
-        ticker = row["_ticker"]
+    frame = long_df.copy()
+
+    frame["_ticker"] = (
+        frame[
+            "raw_ticker"
+        ]
+        .map(
+            canonical_ticker
+        )
+    )
+
+    frame["_name_norm"] = (
+        frame[
+            "raw_name"
+        ]
+        .map(
+            normalized_name
+        )
+    )
+
+    frame["_isin"] = (
+        frame["isin"]
+        .map(
+            lambda value:
+            clean_text(value)
+            .upper()
+        )
+    )
+
+    frame["_sedol"] = (
+        frame["sedol"]
+        .map(
+            lambda value:
+            clean_text(value)
+            .upper()
+        )
+    )
+
+    ticker_to_strong: dict[
+        str,
+        set[str],
+    ] = {}
+
+    for _, row in (
+        frame.iterrows()
+    ):
+
+        ticker = row[
+            "_ticker"
+        ]
+
         if not ticker:
             continue
-        strong = None
-        if valid_isin(row["_isin"]):
-            strong = "ISIN:" + row["_isin"]
-        elif valid_sedol(row["_sedol"]):
-            strong = "SEDOL:" + row["_sedol"]
-        if strong:
-            ticker_to_strong.setdefault(ticker, set()).add(strong)
+
+        strong_id = None
+
+        if valid_isin(
+            row["_isin"]
+        ):
+
+            strong_id = (
+                "ISIN:"
+                + row["_isin"]
+            )
+
+        elif valid_sedol(
+            row["_sedol"]
+        ):
+
+            strong_id = (
+                "SEDOL:"
+                + row["_sedol"]
+            )
+
+        if strong_id:
+
+            ticker_to_strong.setdefault(
+                ticker,
+                set(),
+            ).add(
+                strong_id
+            )
 
     unique_ticker_alias = {
-        t: next(iter(ids))
-        for t, ids in ticker_to_strong.items()
-        if len(ids) == 1
+        ticker:
+        next(
+            iter(strong_ids)
+        )
+        for ticker, strong_ids
+        in ticker_to_strong.items()
+        if len(strong_ids) == 1
     }
 
-    def make_key(row: pd.Series) -> str:
-        if valid_isin(row["_isin"]):
-            return "ISIN:" + row["_isin"]
-        if valid_sedol(row["_sedol"]):
-            return "SEDOL:" + row["_sedol"]
+    def identity(
+        row: pd.Series,
+    ) -> str:
 
-        ticker = row["_ticker"]
-        if ticker and ticker in unique_ticker_alias:
-            return unique_ticker_alias[ticker]
+        if valid_isin(
+            row["_isin"]
+        ):
+
+            return (
+                "ISIN:"
+                + row["_isin"]
+            )
+
+        if valid_sedol(
+            row["_sedol"]
+        ):
+
+            return (
+                "SEDOL:"
+                + row["_sedol"]
+            )
+
+        ticker = row[
+            "_ticker"
+        ]
+
+        if (
+            ticker
+            and
+            ticker
+            in unique_ticker_alias
+        ):
+
+            return (
+                unique_ticker_alias[
+                    ticker
+                ]
+            )
+
         if ticker:
-            # Include normalized name to protect against genuine bare-ticker
-            # collisions across international markets.
-            return f"TK:{ticker}|{row['_name_norm']}"
-        return "NM:" + row["_name_norm"]
 
-    df["_identity"] = df.apply(make_key, axis=1)
-    return df
+            # Critical collision protection:
+            #
+            # AI Paris != AI US
+            # MC Paris != MC US
+            # SU Paris != SU Canada/US
+            #
+            # If no strong identifier is available,
+            # include the name in the key.
+            return (
+                f"TK:{ticker}|"
+                f"{row['_name_norm']}"
+            )
+
+        return (
+            "NM:"
+            + row["_name_norm"]
+        )
+
+    frame["_identity"] = (
+        frame.apply(
+            identity,
+            axis=1,
+        )
+    )
+
+    return frame
 
 
-def choose_canonical_name(group: pd.DataFrame) -> str:
-    identity = str(group["_identity"].iloc[0])
-    tickers = [t for t in group["_ticker"] if t]
-    names = [clean_text(n) for n in group["raw_name"] if clean_text(n)]
+def choose_canonical_name(
+    group: pd.DataFrame,
+) -> str:
 
-    # Override by strong identity first, then ticker, then normalized name.
-    if identity in CANONICAL_NAME_OVERRIDES:
-        return CANONICAL_NAME_OVERRIDES[identity]
-
-    for ticker in tickers:
-        key = f"TK:{ticker}"
-        if key in CANONICAL_NAME_OVERRIDES:
-            return CANONICAL_NAME_OVERRIDES[key]
-
-    for name in names:
-        key = normalized_name(name)
-        if key in CANONICAL_NAME_OVERRIDES:
-            return CANONICAL_NAME_OVERRIDES[key]
+    names = [
+        clean_text(name)
+        for name
+        in group["raw_name"]
+        if clean_text(name)
+    ]
 
     if not names:
-        return tickers[0] if tickers else identity
 
-    counts = pd.Series(names).value_counts()
-    top_count = int(counts.iloc[0])
-    tied = [name for name, count in counts.items() if int(count) == top_count]
+        tickers = [
+            ticker
+            for ticker
+            in group["_ticker"]
+            if ticker
+        ]
 
-    # Deterministic tie-break: prefer a mixed-case display label, then shorter
-    # labels (less provider boilerplate), then lexical order.
-    def score(name: str):
-        mixed_case = not (name.isupper() or name.islower())
-        return (0 if mixed_case else 1, len(name), name.upper())
+        if tickers:
+            return tickers[0]
 
-    return sorted(tied, key=score)[0]
+        return ""
+
+    counts = (
+        pd.Series(names)
+        .value_counts()
+    )
+
+    highest = int(
+        counts.iloc[0]
+    )
+
+    tied = [
+        name
+        for name, count
+        in counts.items()
+        if int(count)
+        == highest
+    ]
+
+    def score(
+        name: str,
+    ) -> tuple:
+
+        mixed_case = not (
+            name.isupper()
+            or
+            name.islower()
+        )
+
+        return (
+            0
+            if mixed_case
+            else 1,
+            len(name),
+            name.upper(),
+        )
+
+    return sorted(
+        tied,
+        key=score,
+    )[0]
 
 
-def choose_canonical_ticker(group: pd.DataFrame) -> str:
-    tickers = [t for t in group["_ticker"] if t]
+def choose_canonical_ticker(
+    group: pd.DataFrame,
+) -> str:
+
+    tickers = [
+        ticker
+        for ticker
+        in group["_ticker"]
+        if ticker
+    ]
+
     if not tickers:
         return ""
 
-    counts = pd.Series(tickers).value_counts()
-    top_count = int(counts.iloc[0])
-    tied = [t for t, count in counts.items() if int(count) == top_count]
+    counts = (
+        pd.Series(tickers)
+        .value_counts()
+    )
 
-    # Prefer exchange-qualified tickers when available because they avoid
-    # international collisions (e.g. 2330.TW).
-    qualified = [t for t in tied if "." in t]
+    highest = int(
+        counts.iloc[0]
+    )
+
+    tied = [
+        ticker
+        for ticker, count
+        in counts.items()
+        if int(count)
+        == highest
+    ]
+
+    # Prefer exchange-qualified tickers.
+    qualified = [
+        ticker
+        for ticker
+        in tied
+        if "." in ticker
+    ]
+
     if qualified:
-        return sorted(qualified)[0]
-    return sorted(tied, key=lambda x: (len(x), x))[0]
+
+        return sorted(
+            qualified
+        )[0]
+
+    return sorted(
+        tied,
+        key=lambda ticker: (
+            len(ticker),
+            ticker,
+        ),
+    )[0]
 
 
-def canonicalize_across_etfs(long_df: pd.DataFrame) -> pd.DataFrame:
-    df = assign_identity_keys(long_df)
+def canonicalize_across_etfs(
+    long_df: pd.DataFrame,
+) -> pd.DataFrame:
 
-    mapping: dict[str, tuple[str, str]] = {}
-    for identity, group in df.groupby("_identity", sort=False):
-        mapping[str(identity)] = (
-            choose_canonical_ticker(group),
-            choose_canonical_name(group),
+    frame = assign_identity_keys(
+        long_df
+    )
+
+    mapping: dict[
+        str,
+        tuple[
+            str,
+            str,
+        ],
+    ] = {}
+
+    for identity, group in (
+        frame.groupby(
+            "_identity",
+            sort=False,
+        )
+    ):
+
+        mapping[
+            str(identity)
+        ] = (
+            choose_canonical_ticker(
+                group
+            ),
+            choose_canonical_name(
+                group
+            ),
         )
 
-    df["canonical_ticker"] = df["_identity"].map(lambda k: mapping[str(k)][0])
-    df["canonical_name"] = df["_identity"].map(lambda k: mapping[str(k)][1])
-
-    # Fallback to raw values where no canonical ticker/name exists.
-    df["canonical_ticker"] = df["canonical_ticker"].where(
-        df["canonical_ticker"] != "",
-        df["raw_ticker"].map(canonical_ticker),
+    frame[
+        "canonical_ticker"
+    ] = frame[
+        "_identity"
+    ].map(
+        lambda key:
+        mapping[
+            str(key)
+        ][0]
     )
-    df["canonical_name"] = df["canonical_name"].where(
-        df["canonical_name"] != "",
-        df["raw_name"].map(clean_text),
+
+    frame[
+        "canonical_name"
+    ] = frame[
+        "_identity"
+    ].map(
+        lambda key:
+        mapping[
+            str(key)
+        ][1]
     )
-    return df
+
+    frame[
+        "canonical_ticker"
+    ] = frame[
+        "canonical_ticker"
+    ].where(
+        frame[
+            "canonical_ticker"
+        ].ne(""),
+        frame[
+            "raw_ticker"
+        ].map(
+            canonical_ticker
+        ),
+    )
+
+    frame[
+        "canonical_name"
+    ] = frame[
+        "canonical_name"
+    ].where(
+        frame[
+            "canonical_name"
+        ].ne(""),
+        frame[
+            "raw_name"
+        ].map(
+            clean_text
+        ),
+    )
+
+    return frame
 
 
-# ---------------------------------------------------------------------------
-# VALIDATION / OUTPUT
-# ---------------------------------------------------------------------------
+# ============================================================
+# LIVE VALIDATION
+# ============================================================
 
 def validate_live_frame(
     etf: str,
-    df: pd.DataFrame,
+    frame: pd.DataFrame,
     previous_count: int | None,
 ) -> None:
-    if df.empty:
-        raise HoldingsError(f"{etf}: no holdings")
 
-    hard_floor = MIN_HOLDINGS_BY_TICKER[etf]
-    required = hard_floor
-    if previous_count and previous_count >= hard_floor:
-        required = max(
-            required,
-            math.floor(previous_count * MIN_PREVIOUS_COUNT_RATIO),
-        )
+    if frame.empty:
 
-    if len(df) < required:
         raise HoldingsError(
-            f"{etf}: only {len(df)} rows; required at least {required}"
+            f"{etf}: no holdings"
         )
 
-    weights = pd.to_numeric(df["weight"], errors="coerce")
-    numeric_count = int(weights.notna().sum())
-    if numeric_count < math.floor(len(df) * 0.98):
-        raise HoldingsError(
-            f"{etf}: only {numeric_count}/{len(df)} rows have numeric weights"
-        )
-
-    if (weights.dropna() < -0.01).any():
-        raise HoldingsError(f"{etf}: unexpected materially negative holding weight")
-
-    total = float(weights.sum(skipna=True))
-    if not MIN_TOTAL_WEIGHT <= total <= MAX_TOTAL_WEIGHT:
-        raise HoldingsError(
-            f"{etf}: weight sum {total:.6f}% outside "
-            f"[{MIN_TOTAL_WEIGHT}, {MAX_TOTAL_WEIGHT}]"
-        )
-
-    if df["raw_name"].astype(str).str.contains(r"<[^>]+>", regex=True).any():
-        raise HoldingsError(f"{etf}: HTML leaked into holding names")
-
-    # Duplicate exact raw rows often indicate repeated HTML widgets or parsing
-    # the same table twice.
-    duplicated = df.duplicated(
-        subset=["raw_ticker", "raw_name", "shares", "market_value"],
-        keep=False,
+    floor = (
+        MIN_HOLDINGS_BY_TICKER[
+            etf
+        ]
     )
-    if int(duplicated.sum()) > max(4, int(len(df) * 0.02)):
+
+    required = floor
+
+    if (
+        previous_count
+        and
+        previous_count >= floor
+    ):
+
+        required = max(
+            floor,
+            math.floor(
+                previous_count
+                * MIN_PREVIOUS_COUNT_RATIO
+            ),
+        )
+
+    if len(frame) < required:
+
         raise HoldingsError(
-            f"{etf}: suspicious duplicate-row count {int(duplicated.sum())}"
+            f"{etf}: only {len(frame)} rows; "
+            f"required at least {required}"
+        )
+
+    weights = pd.to_numeric(
+        frame["weight"],
+        errors="coerce",
+    )
+
+    numeric_count = int(
+        weights
+        .notna()
+        .sum()
+    )
+
+    minimum_numeric = (
+        math.floor(
+            len(frame)
+            * 0.98
+        )
+    )
+
+    if (
+        numeric_count
+        < minimum_numeric
+    ):
+
+        raise HoldingsError(
+            f"{etf}: only "
+            f"{numeric_count}/{len(frame)} "
+            "rows have numeric weights"
+        )
+
+    if (
+        weights
+        .dropna()
+        .lt(-0.01)
+        .any()
+    ):
+
+        raise HoldingsError(
+            f"{etf}: materially negative "
+            "holding weight"
+        )
+
+    total = float(
+        weights
+        .sum(
+            skipna=True
+        )
+    )
+
+    if not (
+        MIN_TOTAL_WEIGHT
+        <= total
+        <= MAX_TOTAL_WEIGHT
+    ):
+
+        raise HoldingsError(
+            f"{etf}: weight sum "
+            f"{total:.8f}% outside "
+            f"[{MIN_TOTAL_WEIGHT}, "
+            f"{MAX_TOTAL_WEIGHT}]"
+        )
+
+    names = (
+        frame[
+            "raw_name"
+        ]
+        .fillna("")
+        .astype(str)
+    )
+
+    if names.str.contains(
+        r"<[^>]+>",
+        regex=True,
+    ).any():
+
+        raise HoldingsError(
+            f"{etf}: HTML leaked "
+            "into holding names"
+        )
+
+    duplicated = (
+        frame
+        .duplicated(
+            subset=[
+                "raw_ticker",
+                "raw_name",
+                "shares",
+                "market_value",
+            ],
+            keep=False,
+        )
+    )
+
+    if (
+        int(
+            duplicated.sum()
+        )
+        >
+        max(
+            4,
+            int(
+                len(frame)
+                * 0.02
+            ),
+        )
+    ):
+
+        raise HoldingsError(
+            f"{etf}: suspicious "
+            "duplicate-row count "
+            f"{int(duplicated.sum())}"
         )
 
 
-def load_previous(combined_path: Path) -> dict[str, pd.DataFrame]:
+# ============================================================
+# PREVIOUS FILE
+# ============================================================
+
+def load_previous(
+    combined_path: Path,
+) -> dict[
+    str,
+    pd.DataFrame,
+]:
+
     if not combined_path.exists():
         return {}
+
     try:
-        previous = pd.read_csv(combined_path)
+
+        previous = pd.read_csv(
+            combined_path
+        )
+
     except Exception as exc:
+
         print(
-            f"WARNING: could not read last-known-good CSV: {exc}",
+            "WARNING: could not read "
+            "last-known-good CSV: "
+            f"{exc}",
             file=sys.stderr,
         )
+
         return {}
 
-    if any(c not in previous.columns for c in OUTPUT_COLS):
+    if any(
+        column
+        not in previous.columns
+        for column
+        in OUTPUT_COLS
+    ):
+
         print(
-            "WARNING: last-known-good schema mismatch; ignoring previous file",
+            "WARNING: previous CSV schema "
+            "does not match expected schema",
             file=sys.stderr,
         )
+
         return {}
 
-    out: dict[str, pd.DataFrame] = {}
-    for ticker, group in previous.groupby("fund_ticker", sort=False):
-        out[str(ticker).upper()] = group[OUTPUT_COLS].copy().reset_index(drop=True)
-    return out
+    result: dict[
+        str,
+        pd.DataFrame,
+    ] = {}
+
+    for ticker, group in (
+        previous.groupby(
+            "fund_ticker",
+            sort=False,
+        )
+    ):
+
+        result[
+            str(ticker).upper()
+        ] = (
+            group[
+                OUTPUT_COLS
+            ]
+            .copy()
+            .reset_index(
+                drop=True
+            )
+        )
+
+    return result
 
 
-def validate_previous_output(etf: str, frame: pd.DataFrame) -> None:
+# ============================================================
+# CRITICAL FALLBACK CLEANUP
+# ============================================================
+
+def sanitize_previous_output(
+    frame: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Clean last-known-good rows BEFORE reuse.
+
+    This is what prevents old Zacks-style tooltip HTML
+    from surviving indefinitely.
+    """
+
+    output = (
+        frame[
+            OUTPUT_COLS
+        ]
+        .copy()
+    )
+
+    output[
+        "holding_ticker"
+    ] = (
+        output[
+            "holding_ticker"
+        ]
+        .map(
+            clean_text
+        )
+    )
+
+    output[
+        "holding_name"
+    ] = (
+        output[
+            "holding_name"
+        ]
+        .map(
+            clean_text
+        )
+    )
+
+    keep = [
+        not is_nonsecurity(
+            ticker,
+            name,
+        )
+        for ticker, name
+        in zip(
+            output[
+                "holding_ticker"
+            ],
+            output[
+                "holding_name"
+            ],
+        )
+    ]
+
+    output = (
+        output.loc[keep]
+        .reset_index(
+            drop=True
+        )
+    )
+
+    # Ranks will be reset after cleanup.
+    output[
+        "rank"
+    ] = range(
+        1,
+        len(output) + 1,
+    )
+
+    return output
+
+
+def fill_output_market_values_from_yahoo(
+    frame: pd.DataFrame,
+    *,
+    label: str,
+    retrieved_at: datetime,
+) -> pd.DataFrame:
+    """
+    Fill missing market values in fallback output rows
+    from shares_held x Yahoo price.
+
+    This is especially relevant for old PPH/SOXQ rows.
+    """
+
+    output = frame.copy()
+
+    market_value = pd.to_numeric(
+        output[
+            "market_value_usd"
+        ],
+        errors="coerce",
+    )
+
+    shares = pd.to_numeric(
+        output[
+            "shares_held"
+        ],
+        errors="coerce",
+    )
+
+    need = (
+        market_value.isna()
+        &
+        shares.notna()
+        &
+        (shares > 0)
+        &
+        output[
+            "holding_ticker"
+        ]
+        .astype(str)
+        .ne("")
+    )
+
+    if not need.any():
+        return output
+
+    required_tickers = (
+        output.loc[
+            need,
+            "holding_ticker",
+        ]
+        .map(
+            clean_text
+        )
+    )
+
+    prices = yahoo_latest_prices(
+        required_tickers
+    )
+
+    filled = 0
+
+    for index in (
+        output.index[need]
+    ):
+
+        ticker = clean_text(
+            output.at[
+                index,
+                "holding_ticker",
+            ]
+        )
+
+        shares_held = to_float(
+            output.at[
+                index,
+                "shares_held",
+            ]
+        )
+
+        price = prices.get(
+            ticker
+        )
+
+        if (
+            price is None
+            or
+            shares_held is None
+            or
+            shares_held <= 0
+        ):
+            continue
+
+        output.at[
+            index,
+            "market_value_usd",
+        ] = (
+            shares_held
+            * price
+        )
+
+        filled += 1
+
+    if filled:
+
+        output[
+            "retrieved_at_utc"
+        ] = (
+            retrieved_at
+            .isoformat()
+            .replace(
+                "+00:00",
+                "Z",
+            )
+        )
+
+    remaining = int(
+        pd.to_numeric(
+            output[
+                "market_value_usd"
+            ],
+            errors="coerce",
+        )
+        .isna()
+        .sum()
+    )
+
+    print(
+        f"[{label}] Fallback Yahoo "
+        f"MV backfill: {filled} filled, "
+        f"{remaining} blank",
+        file=sys.stderr,
+    )
+
+    return output
+
+
+# ============================================================
+# OUTPUT HTML GUARD
+# ============================================================
+
+def assert_no_html_remnants(
+    frame: pd.DataFrame,
+) -> None:
+
+    names = (
+        frame[
+            "holding_name"
+        ]
+        .fillna("")
+        .astype(str)
+    )
+
+    bad = names.str.contains(
+        (
+            r"<[^>]+>"
+            r"|"
+            r"&(?:"
+            r"[A-Za-z]+"
+            r"|#\d+"
+            r"|#x[0-9A-Fa-f]+"
+            r");"
+        ),
+        regex=True,
+    )
+
+    if not bad.any():
+        return
+
+    sample = (
+        frame.loc[
+            bad,
+            [
+                "fund_ticker",
+                "holding_ticker",
+                "holding_name",
+            ],
+        ]
+        .head(10)
+        .to_dict(
+            orient="records"
+        )
+    )
+
+    raise HoldingsError(
+        "HTML/entity remnants survived "
+        "holding-name cleanup: "
+        f"{sample}"
+    )
+
+
+# ============================================================
+# PREVIOUS OUTPUT VALIDATION
+# ============================================================
+
+def validate_output_for_etf(
+    etf: str,
+    frame: pd.DataFrame,
+) -> None:
+
     if frame.empty:
-        raise HoldingsError(f"{etf}: last-known-good rows empty")
 
-    floor = MIN_HOLDINGS_BY_TICKER[etf]
+        raise HoldingsError(
+            f"{etf}: output is empty"
+        )
+
+    floor = (
+        MIN_HOLDINGS_BY_TICKER[
+            etf
+        ]
+    )
+
     if len(frame) < floor:
+
         raise HoldingsError(
-            f"{etf}: last-known-good has only {len(frame)} rows (<{floor})"
+            f"{etf}: only "
+            f"{len(frame)} rows "
+            f"(< {floor})"
         )
 
-    weights = pd.to_numeric(frame["weight"], errors="coerce")
-    total = float(weights.sum(skipna=True))
-    if not MIN_TOTAL_WEIGHT <= total <= MAX_TOTAL_WEIGHT:
+    weights = pd.to_numeric(
+        frame[
+            "weight"
+        ],
+        errors="coerce",
+    )
+
+    total = float(
+        weights.sum(
+            skipna=True
+        )
+    )
+
+    if not (
+        MIN_TOTAL_WEIGHT
+        <= total
+        <= MAX_TOTAL_WEIGHT
+    ):
+
         raise HoldingsError(
-            f"{etf}: last-known-good weight sum {total:.4f}% invalid"
+            f"{etf}: weight sum "
+            f"{total:.8f}% invalid"
         )
 
+
+# ============================================================
+# NORMALISED OUTPUT
+# ============================================================
 
 def normalized_output_for_etf(
     etf: str,
@@ -1646,59 +4660,178 @@ def normalized_output_for_etf(
     source_date: str,
     retrieved_at: datetime,
 ) -> pd.DataFrame:
-    fund = canonical_df[canonical_df["etf"] == etf].copy()
-    fund["weight"] = pd.to_numeric(fund["weight"], errors="coerce")
-    fund["shares"] = pd.to_numeric(fund["shares"], errors="coerce")
-    fund["market_value"] = pd.to_numeric(
-        fund["market_value"], errors="coerce"
+
+    fund = (
+        canonical_df[
+            canonical_df[
+                "etf"
+            ].eq(etf)
+        ]
+        .copy()
     )
 
-    fund = fund.sort_values(
-        "weight", ascending=False, na_position="last"
-    ).reset_index(drop=True)
+    fund["weight"] = pd.to_numeric(
+        fund["weight"],
+        errors="coerce",
+    )
 
-    out = pd.DataFrame(
+    fund["shares"] = pd.to_numeric(
+        fund["shares"],
+        errors="coerce",
+    )
+
+    fund[
+        "market_value"
+    ] = pd.to_numeric(
+        fund[
+            "market_value"
+        ],
+        errors="coerce",
+    )
+
+    fund = (
+        fund
+        .sort_values(
+            "weight",
+            ascending=False,
+            na_position="last",
+        )
+        .reset_index(
+            drop=True
+        )
+    )
+
+    output = pd.DataFrame(
         {
-            "source_date": source_date,
-            "retrieved_at_utc": retrieved_at.isoformat().replace("+00:00", "Z"),
+            "source_date": (
+                source_date
+            ),
+            "retrieved_at_utc": (
+                retrieved_at
+                .isoformat()
+                .replace(
+                    "+00:00",
+                    "Z",
+                )
+            ),
             "fund_ticker": etf,
-            "provider": PROVIDER_LABELS[etf],
-            "rank": range(1, len(fund) + 1),
-            "holding_ticker": fund["canonical_ticker"],
-            "holding_name": fund["canonical_name"],
-            "weight": fund["weight"],
-            "shares_held": fund["shares"],
-            "market_value_usd": fund["market_value"],
+            "provider": (
+                PROVIDER_LABELS[
+                    etf
+                ]
+            ),
+            "rank": range(
+                1,
+                len(fund) + 1,
+            ),
+            "holding_ticker": (
+                fund[
+                    "canonical_ticker"
+                ]
+            ),
+            "holding_name": (
+                fund[
+                    "canonical_name"
+                ]
+            ),
+            "weight": (
+                fund[
+                    "weight"
+                ]
+            ),
+            "shares_held": (
+                fund[
+                    "shares"
+                ]
+            ),
+            "market_value_usd": (
+                fund[
+                    "market_value"
+                ]
+            ),
         }
     )
-    return out[OUTPUT_COLS]
+
+    return output[
+        OUTPUT_COLS
+    ]
 
 
-def write_csv_atomic(frame: pd.DataFrame, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    tmp = destination.with_name(f".{destination.name}.tmp")
+# ============================================================
+# ATOMIC WRITE
+# ============================================================
+
+def write_csv_atomic(
+    frame: pd.DataFrame,
+    destination: Path,
+) -> None:
+
+    destination.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    temp_path = (
+        destination
+        .with_name(
+            "."
+            + destination.name
+            + ".tmp"
+        )
+    )
+
     try:
+
         frame.to_csv(
-            tmp,
+            temp_path,
             index=False,
             encoding="utf-8-sig",
             float_format="%.15g",
         )
-        if not tmp.exists() or tmp.stat().st_size == 0:
-            raise HoldingsError(f"Generated empty CSV: {tmp}")
-        os.replace(tmp, destination)
+
+        if (
+            not temp_path.exists()
+            or
+            temp_path.stat().st_size
+            == 0
+        ):
+
+            raise HoldingsError(
+                "Generated CSV is empty"
+            )
+
+        os.replace(
+            temp_path,
+            destination,
+        )
+
     finally:
-        if tmp.exists():
-            tmp.unlink()
+
+        if temp_path.exists():
+
+            try:
+                temp_path.unlink()
+            except Exception:
+                pass
 
 
-# ---------------------------------------------------------------------------
-# PIPELINE
-# ---------------------------------------------------------------------------
+# ============================================================
+# FETCHER REGISTRY
+# ============================================================
 
-Fetcher = Callable[[requests.Session, str, int], FetchResult]
+Fetcher = Callable[
+    [
+        requests.Session,
+        str,
+        int,
+    ],
+    FetchResult,
+]
 
-FETCHERS: dict[str, Fetcher] = {
+FETCHERS: dict[
+    str,
+    Fetcher,
+] = {
     "VGT": fetch_vanguard,
     "ACWI": fetch_ishares,
     "XLF": fetch_ssga,
@@ -1710,13 +4843,18 @@ FETCHERS: dict[str, Fetcher] = {
     "SOXQ": fetch_invesco,
 }
 
-DEFAULT_ETFS = ["VGT", "ACWI", "XLF", "XLI", "XLC", "PPH", "MLPX", "GRID", "SOXQ"]
 
+# ============================================================
+# FETCH LIVE
+# ============================================================
 
 def fetch_all_live(
     session: requests.Session,
     etfs: list[str],
-    previous: dict[str, pd.DataFrame],
+    previous: dict[
+        str,
+        pd.DataFrame,
+    ],
     timeout: int,
 ) -> tuple[
     dict[str, pd.DataFrame],
@@ -1724,41 +4862,149 @@ def fetch_all_live(
     dict[str, str],
     dict[str, str],
 ]:
-    live: dict[str, pd.DataFrame] = {}
-    source_dates: dict[str, str] = {}
-    precision_methods: dict[str, str] = {}
-    failures: dict[str, str] = {}
+
+    live: dict[
+        str,
+        pd.DataFrame,
+    ] = {}
+
+    source_dates: dict[
+        str,
+        str,
+    ] = {}
+
+    precision_methods: dict[
+        str,
+        str,
+    ] = {}
+
+    failures: dict[
+        str,
+        str,
+    ] = {}
 
     for etf in etfs:
-        print(f"[{etf}] Fetching {PROVIDER_LABELS[etf]}...", file=sys.stderr)
+
+        provider = (
+            PROVIDER_LABELS[
+                etf
+            ]
+        )
+
+        print(
+            f"[{etf}] Fetching "
+            f"{provider}...",
+            file=sys.stderr,
+        )
+
         try:
-            result = FETCHERS[etf](session, etf, timeout)
-            frame = result.frame.copy()
+
+            result = (
+                FETCHERS[
+                    etf
+                ](
+                    session,
+                    etf,
+                    timeout,
+                )
+            )
+
+            frame = (
+                result.frame
+                .copy()
+            )
 
             if etf == "VGT":
-                frame = drift_vgt_with_yahoo(frame, result.source_date)
-                result.precision_method = "vanguard_shares_x_live_price"
 
-            previous_count = len(previous[etf]) if etf in previous else None
-            validate_live_frame(etf, frame, previous_count)
+                frame = (
+                    drift_vgt_with_yahoo(
+                        frame,
+                        result.source_date,
+                    )
+                )
+
+                result.precision_method = (
+                    "vanguard_shares_x_live_price"
+                )
+
+            previous_count = (
+                len(
+                    previous[
+                        etf
+                    ]
+                )
+                if etf
+                in previous
+                else None
+            )
+
+            validate_live_frame(
+                etf,
+                frame,
+                previous_count,
+            )
 
             frame["etf"] = etf
-            live[etf] = frame
-            source_dates[etf] = result.source_date
-            precision_methods[etf] = result.precision_method
+
+            live[
+                etf
+            ] = frame
+
+            source_dates[
+                etf
+            ] = (
+                result.source_date
+            )
+
+            precision_methods[
+                etf
+            ] = (
+                result.precision_method
+            )
+
+            total_weight = float(
+                pd.to_numeric(
+                    frame[
+                        "weight"
+                    ],
+                    errors="coerce",
+                )
+                .sum(
+                    skipna=True
+                )
+            )
 
             print(
-                f"[{etf}] OK: {len(frame)} rows, "
-                f"{frame['weight'].sum(skipna=True):.8f}% "
+                f"[{etf}] OK: "
+                f"{len(frame)} rows, "
+                f"{total_weight:.8f}% "
                 f"({result.precision_method})",
                 file=sys.stderr,
             )
+
         except Exception as exc:
-            failures[etf] = str(exc)
-            print(f"[{etf}] LIVE FAILED: {exc}", file=sys.stderr)
 
-    return live, source_dates, precision_methods, failures
+            failures[
+                etf
+            ] = str(exc)
 
+            print(
+                f"[{etf}] LIVE FAILED: "
+                f"{exc}",
+                file=sys.stderr,
+            )
+
+    return (
+        live,
+        source_dates,
+        precision_methods,
+        failures,
+    )
+
+
+# ============================================================
+# MAIN PIPELINE
+# ============================================================
 
 def run(
     etfs: list[str],
@@ -1766,154 +5012,547 @@ def run(
     combined_name: str,
     timeout: int,
 ) -> int:
-    combined_path = out_dir / combined_name
-    previous = load_previous(combined_path)
+
+    combined_path = (
+        out_dir
+        / combined_name
+    )
+
+    previous = load_previous(
+        combined_path
+    )
 
     with build_session() as session:
-        live, source_dates, precision_methods, live_failures = fetch_all_live(
+
+        (
+            live,
+            source_dates,
+            precision_methods,
+            live_failures,
+        ) = fetch_all_live(
             session,
             etfs,
             previous,
             timeout,
         )
 
-    # Canonical naming/identity is performed jointly across ALL successful live
-    # funds so the same security gets the same display ticker/name across ETFs.
-    canonical_live: pd.DataFrame | None = None
+    canonical_live: (
+        pd.DataFrame
+        | None
+    ) = None
+
     if live:
+
         stacked = pd.concat(
-            [live[e] for e in etfs if e in live],
+            [
+                live[etf]
+                for etf
+                in etfs
+                if etf in live
+            ],
             ignore_index=True,
         )
-        canonical_live = canonicalize_across_etfs(stacked)
+
+        canonical_live = (
+            canonicalize_across_etfs(
+                stacked
+            )
+        )
 
     retrieved_at = utc_now()
-    final_by_etf: dict[str, pd.DataFrame] = {}
-    source_status: dict[str, str] = {}
-    fatal: dict[str, str] = {}
+
+    final_by_etf: dict[
+        str,
+        pd.DataFrame,
+    ] = {}
+
+    source_status: dict[
+        str,
+        str,
+    ] = {}
+
+    fatal: dict[
+        str,
+        str,
+    ] = {}
 
     for etf in etfs:
-        if etf in live and canonical_live is not None:
-            out = normalized_output_for_etf(
-                etf,
-                canonical_live,
-                source_dates[etf],
-                retrieved_at,
+
+        # ----------------------------------------------------
+        # Live source succeeded
+        # ----------------------------------------------------
+
+        if (
+            etf in live
+            and
+            canonical_live
+            is not None
+        ):
+
+            output = (
+                normalized_output_for_etf(
+                    etf,
+                    canonical_live,
+                    source_dates[
+                        etf
+                    ],
+                    retrieved_at,
+                )
             )
 
-            # Final output-level sanity check.
-            validate_previous_output(etf, out)
-            final_by_etf[etf] = out
-            source_status[etf] = (
-                f"{PROVIDER_LABELS[etf]} / {precision_methods[etf]}"
+            validate_output_for_etf(
+                etf,
+                output,
             )
+
+            final_by_etf[
+                etf
+            ] = output
+
+            source_status[
+                etf
+            ] = (
+                PROVIDER_LABELS[
+                    etf
+                ]
+                + " / "
+                + precision_methods[
+                    etf
+                ]
+            )
+
             continue
 
+        # ----------------------------------------------------
+        # Live failed -> clean last-known-good
+        # ----------------------------------------------------
+
         if etf in previous:
+
             try:
-                prev = previous[etf].copy()
-                validate_previous_output(etf, prev)
-                final_by_etf[etf] = prev[OUTPUT_COLS]
-                source_status[etf] = "Last-known-good"
+
+                fallback = (
+                    sanitize_previous_output(
+                        previous[
+                            etf
+                        ].copy()
+                    )
+                )
+
+                validate_output_for_etf(
+                    etf,
+                    fallback,
+                )
+
+                fallback = (
+                    fill_output_market_values_from_yahoo(
+                        fallback,
+                        label=etf,
+                        retrieved_at=(
+                            retrieved_at
+                        ),
+                    )
+                )
+
+                assert_no_html_remnants(
+                    fallback
+                )
+
+                final_by_etf[
+                    etf
+                ] = fallback[
+                    OUTPUT_COLS
+                ]
+
+                source_status[
+                    etf
+                ] = (
+                    "Last-known-good / "
+                    "cleaned + MV backfill"
+                )
+
                 print(
-                    f"[{etf}] Using last-known-good rows; "
-                    f"original timestamp preserved",
+                    f"[{etf}] Using cleaned "
+                    "last-known-good rows; "
+                    "original source_date "
+                    "preserved",
                     file=sys.stderr,
                 )
+
                 continue
+
             except Exception as exc:
-                fatal[etf] = (
-                    f"live failed ({live_failures.get(etf, 'unknown')}); "
-                    f"previous invalid ({exc})"
+
+                fatal[
+                    etf
+                ] = (
+                    "live failed "
+                    f"({live_failures.get(etf, 'unknown')}); "
+                    "previous invalid "
+                    f"({exc})"
                 )
+
         else:
-            fatal[etf] = (
-                f"live failed ({live_failures.get(etf, 'unknown')}); "
-                f"no last-known-good rows"
+
+            fatal[
+                etf
+            ] = (
+                "live failed "
+                f"({live_failures.get(etf, 'unknown')}); "
+                "no last-known-good rows"
             )
 
+    # --------------------------------------------------------
+    # Abort if any ETF has neither live nor valid fallback
+    # --------------------------------------------------------
+
     if fatal:
+
         print(
-            "\nUpdate aborted. Existing combined CSV was NOT replaced.",
+            "\nUpdate aborted. Existing "
+            "combined CSV was NOT replaced.",
             file=sys.stderr,
         )
-        for etf, reason in fatal.items():
-            print(f"  - {etf}: {reason}", file=sys.stderr)
+
+        for etf, reason in (
+            fatal.items()
+        ):
+
+            print(
+                f"  - {etf}: {reason}",
+                file=sys.stderr,
+            )
+
         return 1
 
+    # --------------------------------------------------------
+    # Combine
+    # --------------------------------------------------------
+
     combined = pd.concat(
-        [final_by_etf[e] for e in etfs],
+        [
+            final_by_etf[
+                etf
+            ]
+            for etf
+            in etfs
+        ],
         ignore_index=True,
     )
 
-    if combined["fund_ticker"].nunique() != len(etfs):
+    # --------------------------------------------------------
+    # Exact fund-set validation
+    # --------------------------------------------------------
+
+    actual_funds = set(
+        combined[
+            "fund_ticker"
+        ]
+        .dropna()
+        .astype(str)
+        .unique()
+    )
+
+    expected_funds = set(
+        etfs
+    )
+
+    if actual_funds != expected_funds:
+
         print(
-            "ERROR: combined output does not contain every requested ETF; "
-            "existing CSV was not replaced",
+            "ERROR: combined output ETF set "
+            "does not match request. "
+            f"Expected={expected_funds}, "
+            f"Actual={actual_funds}",
             file=sys.stderr,
         )
+
         return 1
 
-    write_csv_atomic(combined, combined_path)
+    # --------------------------------------------------------
+    # Exact schema validation
+    # --------------------------------------------------------
+
+    if (
+        list(
+            combined.columns
+        )
+        != OUTPUT_COLS
+    ):
+
+        print(
+            "ERROR: combined schema changed: "
+            f"{list(combined.columns)}",
+            file=sys.stderr,
+        )
+
+        return 1
+
+    # --------------------------------------------------------
+    # HTML must be ZERO
+    # --------------------------------------------------------
+
+    try:
+
+        assert_no_html_remnants(
+            combined
+        )
+
+    except Exception as exc:
+
+        print(
+            f"ERROR: {exc}",
+            file=sys.stderr,
+        )
+
+        return 1
+
+    # --------------------------------------------------------
+    # Market-value diagnostics
+    # --------------------------------------------------------
+
+    market_value = pd.to_numeric(
+        combined[
+            "market_value_usd"
+        ],
+        errors="coerce",
+    )
+
+    blanks = (
+        market_value.isna()
+    )
+
+    if blanks.any():
+
+        print(
+            "\nMarket-value blanks "
+            "remaining by fund:",
+            file=sys.stderr,
+        )
+
+        counts = (
+            combined.loc[
+                blanks
+            ]
+            .groupby(
+                "fund_ticker"
+            )
+            .size()
+            .sort_values(
+                ascending=False
+            )
+        )
+
+        for fund, count in (
+            counts.items()
+        ):
+
+            print(
+                f"  - {fund}: "
+                f"{count}",
+                file=sys.stderr,
+            )
+
+    else:
+
+        print(
+            "\nMarket-value coverage: "
+            "100.00%",
+            file=sys.stderr,
+        )
+
+    # --------------------------------------------------------
+    # Final weight checks again
+    # --------------------------------------------------------
+
+    for etf, group in (
+        combined.groupby(
+            "fund_ticker",
+            sort=False,
+        )
+    ):
+
+        try:
+
+            validate_output_for_etf(
+                str(etf),
+                group,
+            )
+
+        except Exception as exc:
+
+            print(
+                f"ERROR: final validation "
+                f"failed for {etf}: "
+                f"{exc}",
+                file=sys.stderr,
+            )
+
+            return 1
+
+    # --------------------------------------------------------
+    # Atomic publication
+    # --------------------------------------------------------
+
+    write_csv_atomic(
+        combined,
+        combined_path,
+    )
 
     print(
-        f"\nPublished {len(combined)} rows across {len(etfs)} ETFs -> "
-        f"{combined_path}",
+        "\nPublished "
+        f"{len(combined):,} rows "
+        f"across {len(etfs)} ETFs "
+        f"-> {combined_path}",
         file=sys.stderr,
     )
-    print("Sources used:", file=sys.stderr)
+
+    print(
+        "\nSources used:",
+        file=sys.stderr,
+    )
+
     for etf in etfs:
-        print(f"  - {etf}: {source_status[etf]}", file=sys.stderr)
+
+        print(
+            f"  - {etf}: "
+            f"{source_status[etf]}",
+            file=sys.stderr,
+        )
 
     return 0
 
 
+# ============================================================
+# CLI
+# ============================================================
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Update provider-first "
+            "ETF holdings CSV."
+        )
+    )
+
     parser.add_argument(
         "tickers",
         nargs="*",
-        help="Optional ETF tickers. Defaults to the existing 9-fund basket.",
+        help=(
+            "ETF tickers. "
+            "Defaults to the standard "
+            "nine-fund basket."
+        ),
     )
-    parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
-    parser.add_argument("--combined-name", default=DEFAULT_COMBINED_NAME)
-    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
+
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=(
+            DEFAULT_OUT_DIR
+        ),
+    )
+
+    parser.add_argument(
+        "--combined-name",
+        default=(
+            DEFAULT_COMBINED_NAME
+        ),
+    )
+
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=(
+            DEFAULT_TIMEOUT_SECONDS
+        ),
+    )
+
     return parser.parse_args()
 
 
 def main() -> int:
+
     args = parse_args()
 
-    if Path(args.combined_name).name != args.combined_name:
+    if (
+        Path(
+            args.combined_name
+        ).name
+        != args.combined_name
+    ):
+
         print(
-            "ERROR: --combined-name must be a filename, not a path",
+            "ERROR: --combined-name must "
+            "be a filename, not a path",
             file=sys.stderr,
         )
+
         return 2
 
     if args.timeout <= 0:
-        print("ERROR: --timeout must be > 0", file=sys.stderr)
-        return 2
 
-    etfs = (
-        [t.strip().upper() for t in args.tickers if t.strip()]
-        if args.tickers
-        else DEFAULT_ETFS.copy()
-    )
-
-    # Deduplicate while preserving order.
-    etfs = list(dict.fromkeys(etfs))
-
-    unknown = [e for e in etfs if e not in FETCHERS]
-    if unknown:
         print(
-            f"ERROR: unknown ETF(s): {unknown}. Known: {list(FETCHERS)}",
+            "ERROR: --timeout must be > 0",
             file=sys.stderr,
         )
+
         return 2
 
-    return run(etfs, args.out_dir, args.combined_name, args.timeout)
+    if args.tickers:
+
+        etfs = [
+            ticker
+            .strip()
+            .upper()
+            for ticker
+            in args.tickers
+            if ticker.strip()
+        ]
+
+    else:
+
+        etfs = (
+            DEFAULT_ETFS.copy()
+        )
+
+    # Deduplicate while preserving order.
+    etfs = list(
+        dict.fromkeys(
+            etfs
+        )
+    )
+
+    unknown = [
+        etf
+        for etf
+        in etfs
+        if etf
+        not in FETCHERS
+    ]
+
+    if unknown:
+
+        print(
+            "ERROR: unknown ETF(s): "
+            f"{unknown}. "
+            "Known ETFs: "
+            f"{list(FETCHERS)}",
+            file=sys.stderr,
+        )
+
+        return 2
+
+    return run(
+        etfs,
+        args.out_dir,
+        args.combined_name,
+        args.timeout,
+    )
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(
+        main()
+    )
