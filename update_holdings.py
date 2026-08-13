@@ -1344,7 +1344,6 @@ def parse_downloaded_holdings(
 
     raise HoldingsError(
     f"{provider}: response was not "
-}: response was not "
     "recognisable CSV or Excel "
     f"(content-type={content_type}, "
     f"url={response.url})"
