@@ -294,15 +294,13 @@ def clean_text(value: Any) -> str:
     """
     Convert provider text to plain clean text.
 
-    IMPORTANT:
     Old fallback rows may contain:
-
       <span class="truncated_text_single"
             title="Novo Nordisk A/S">
             Novo Nordisk A/..
       </span>
 
-    We extract the title attribute BEFORE stripping tags.
+    Extract title before stripping tags.
     """
 
     if value is None or value is pd.NA:
@@ -324,10 +322,8 @@ def clean_text(value: Any) -> str:
     }:
         return ""
 
-    # Decode entities first.
     text = html_lib.unescape(text)
 
-    # Recover full tooltip value.
     title_match = re.search(
         r"""title\s*=\s*["']([^"']+)["']""",
         text,
@@ -343,7 +339,6 @@ def clean_text(value: Any) -> str:
             text,
         )
 
-    # Decode again in case title itself had &amp; etc.
     text = html_lib.unescape(text)
 
     text = re.sub(
@@ -571,7 +566,6 @@ def pick_col(
         for column in df.columns
     ]
 
-    # Exact-ish match first.
     for candidate in candidates:
 
         candidate_lower = candidate.lower()
@@ -581,7 +575,6 @@ def pick_col(
             if lowered == candidate_lower:
                 return original
 
-    # Contains match second.
     for candidate in candidates:
 
         candidate_lower = candidate.lower()
@@ -828,6 +821,15 @@ def drop_nonsecurity_rows(
 def maybe_recompute_from_market_value(
     df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, str]:
+    """
+    Recompute full-precision weights when complete market values exist.
+
+    Negative market values are allowed only for genuine
+    cash / FX / financing rows. This is important for ACWI,
+    where iShares can publish a negative USD cash balance.
+
+    The signed portfolio market value is used as the denominator.
+    """
 
     output = df.copy()
 
@@ -839,32 +841,65 @@ def maybe_recompute_from_market_value(
         errors="coerce",
     )
 
+    # Require complete market-value coverage.
+    if not market_value.notna().all():
+        return output, "provider_weight"
+
+    # Negative values are permitted only for non-security rows
+    # such as cash / FX.
+    negative_mask = market_value < 0
+
+    if negative_mask.any():
+
+        for idx in output.index[negative_mask]:
+
+            ticker = clean_text(
+                output.at[
+                    idx,
+                    "raw_ticker",
+                ]
+            )
+
+            name = clean_text(
+                output.at[
+                    idx,
+                    "raw_name",
+                ]
+            )
+
+            if not is_nonsecurity(
+                ticker,
+                name,
+            ):
+                return (
+                    output,
+                    "provider_weight",
+                )
+
+    # Signed denominator:
+    # positive securities + positive cash - negative cash.
+    total = float(
+        market_value.sum()
+    )
+
     if (
-        market_value.notna().all()
-        and
-        (market_value >= 0).all()
-        and
-        float(market_value.sum()) > 0
+        not math.isfinite(total)
+        or total <= 0
     ):
-
-        total = float(
-            market_value.sum()
-        )
-
-        output["weight"] = (
-            market_value
-            / total
-            * 100.0
-        )
-
         return (
             output,
-            "market_value_recomputed",
+            "provider_weight",
         )
+
+    output["weight"] = (
+        market_value
+        / total
+        * 100.0
+    )
 
     return (
         output,
-        "provider_weight",
+        "market_value_recomputed",
     )
 
 
@@ -1271,7 +1306,6 @@ def yahoo_ticker(
         ticker,
     )
 
-    # Preserve actual exchange suffixes.
     match = re.fullmatch(
         r"[A-Z0-9]+\.([A-Z]{1,4})",
         ticker,
@@ -1284,8 +1318,6 @@ def yahoo_ticker(
         if suffix in YAHOO_EXCHANGE_SUFFIXES:
             return ticker
 
-    # US class shares:
-    # BRK.B -> BRK-B
     ticker = (
         ticker
         .replace("/", "-")
@@ -1804,13 +1836,6 @@ def fetch_ssga(
         result
     )
 
-    # State Street export currently gives us precise
-    # shares + weights but MV can be blank.
-    #
-    # Fill MV from shares x current Yahoo price.
-    #
-    # DO NOT recompute weights from these values because
-    # State Street's official provider weight is preferred.
     result = (
         fill_std_market_values_from_yahoo(
             result,
@@ -1922,13 +1947,26 @@ def fetch_ishares(
         ),
     )
 
-    # Use market values before removing cash / FX,
-    # preserving provider denominator.
+    # Recompute BEFORE removing cash/FX.
+    #
+    # This preserves the complete signed fund denominator,
+    # including any negative USD cash balance.
     result_all, precision = (
         maybe_recompute_from_market_value(
             result_all
         )
     )
+
+    # CRITICAL ACWI PRECISION GUARD:
+    #
+    # Never silently fall back to iShares' rounded 2dp
+    # provider weights when complete market-value data should
+    # allow full-precision reconstruction.
+    if precision != "market_value_recomputed":
+        raise HoldingsError(
+            "ACWI: iShares market-value recomputation did not occur; "
+            "refusing to publish rounded provider weights"
+        )
 
     result = drop_nonsecurity_rows(
         result_all
@@ -1991,7 +2029,6 @@ def fetch_globalx(
         )
     )
 
-    # Fallback discovery if link text changes.
     if not csv_url:
 
         try:
@@ -2192,16 +2229,6 @@ def parse_firsttrust_dom(
         if len(cells) < 6:
             continue
 
-        # First Trust layout is normally:
-        #
-        # Security Name
-        # Identifier
-        # CUSIP
-        # Classification
-        # Shares
-        # Market Value
-        # Weighting
-
         weight = to_float(
             cells[-1]
         )
@@ -2322,23 +2349,10 @@ def fetch_vaneck(
     etf: str,
     timeout: int,
 ) -> FetchResult:
-    """
-    Fetch PPH from VanEck.
-
-    First choice:
-      official XLS endpoint behind "Download XLS"
-
-    Second choice:
-      discover the download link from the official holdings page
-    """
 
     errors: list[str] = []
 
     source_date = iso_today()
-
-    # --------------------------------------------------------
-    # 1. Direct official XLS endpoint
-    # --------------------------------------------------------
 
     try:
 
@@ -2439,10 +2453,6 @@ def fetch_vaneck(
         errors.append(
             f"direct XLSX: {exc}"
         )
-
-    # --------------------------------------------------------
-    # 2. Discover current XLS link from official page
-    # --------------------------------------------------------
 
     try:
 
@@ -2601,28 +2611,12 @@ def fetch_invesco(
     etf: str,
     timeout: int,
 ) -> FetchResult:
-    """
-    Best-effort official Invesco route.
-
-    Invesco may return HTTP 406 to automation.
-
-    IMPORTANT:
-    A failed product-page request must NOT prevent the
-    direct official export URL being attempted.
-
-    If both official routes fail, this function raises and
-    the main pipeline uses cleaned last-known-good SOXQ rows.
-    """
 
     errors: list[str] = []
 
     source_date = iso_today()
 
     candidates: list[str] = []
-
-    # --------------------------------------------------------
-    # Product page / link discovery
-    # --------------------------------------------------------
 
     try:
 
@@ -2685,16 +2679,11 @@ def fetch_invesco(
             f"product page: {exc}"
         )
 
-    # Direct official legacy export path.
     candidates.append(
         INVESCO_EXPORT_URL.format(
             ticker=etf
         )
     )
-
-    # --------------------------------------------------------
-    # Try candidates
-    # --------------------------------------------------------
 
     for url in dict.fromkeys(
         candidates
@@ -3860,14 +3849,6 @@ def assign_identity_keys(
 
         if ticker:
 
-            # Critical collision protection:
-            #
-            # AI Paris != AI US
-            # MC Paris != MC US
-            # SU Paris != SU Canada/US
-            #
-            # If no strong identifier is available,
-            # include the name in the key.
             return (
                 f"TK:{ticker}|"
                 f"{row['_name_norm']}"
@@ -3985,7 +3966,6 @@ def choose_canonical_ticker(
         == highest
     ]
 
-    # Prefer exchange-qualified tickers.
     qualified = [
         ticker
         for ticker
@@ -4329,18 +4309,12 @@ def load_previous(
 
 
 # ============================================================
-# CRITICAL FALLBACK CLEANUP
+# FALLBACK CLEANUP
 # ============================================================
 
 def sanitize_previous_output(
     frame: pd.DataFrame,
 ) -> pd.DataFrame:
-    """
-    Clean last-known-good rows BEFORE reuse.
-
-    This is what prevents old Zacks-style tooltip HTML
-    from surviving indefinitely.
-    """
 
     output = (
         frame[
@@ -4394,7 +4368,6 @@ def sanitize_previous_output(
         )
     )
 
-    # Ranks will be reset after cleanup.
     output[
         "rank"
     ] = range(
@@ -4411,12 +4384,6 @@ def fill_output_market_values_from_yahoo(
     label: str,
     retrieved_at: datetime,
 ) -> pd.DataFrame:
-    """
-    Fill missing market values in fallback output rows
-    from shares_held x Yahoo price.
-
-    This is especially relevant for old PPH/SOXQ rows.
-    """
 
     output = frame.copy()
 
@@ -4597,7 +4564,7 @@ def assert_no_html_remnants(
 
 
 # ============================================================
-# PREVIOUS OUTPUT VALIDATION
+# OUTPUT VALIDATION
 # ============================================================
 
 def validate_output_for_etf(
@@ -5078,10 +5045,6 @@ def run(
 
     for etf in etfs:
 
-        # ----------------------------------------------------
-        # Live source succeeded
-        # ----------------------------------------------------
-
         if (
             etf in live
             and
@@ -5122,10 +5085,6 @@ def run(
             )
 
             continue
-
-        # ----------------------------------------------------
-        # Live failed -> clean last-known-good
-        # ----------------------------------------------------
 
         if etf in previous:
 
@@ -5202,10 +5161,6 @@ def run(
                 "no last-known-good rows"
             )
 
-    # --------------------------------------------------------
-    # Abort if any ETF has neither live nor valid fallback
-    # --------------------------------------------------------
-
     if fatal:
 
         print(
@@ -5225,10 +5180,6 @@ def run(
 
         return 1
 
-    # --------------------------------------------------------
-    # Combine
-    # --------------------------------------------------------
-
     combined = pd.concat(
         [
             final_by_etf[
@@ -5239,10 +5190,6 @@ def run(
         ],
         ignore_index=True,
     )
-
-    # --------------------------------------------------------
-    # Exact fund-set validation
-    # --------------------------------------------------------
 
     actual_funds = set(
         combined[
@@ -5269,10 +5216,6 @@ def run(
 
         return 1
 
-    # --------------------------------------------------------
-    # Exact schema validation
-    # --------------------------------------------------------
-
     if (
         list(
             combined.columns
@@ -5288,10 +5231,6 @@ def run(
 
         return 1
 
-    # --------------------------------------------------------
-    # HTML must be ZERO
-    # --------------------------------------------------------
-
     try:
 
         assert_no_html_remnants(
@@ -5306,10 +5245,6 @@ def run(
         )
 
         return 1
-
-    # --------------------------------------------------------
-    # Market-value diagnostics
-    # --------------------------------------------------------
 
     market_value = pd.to_numeric(
         combined[
@@ -5361,10 +5296,6 @@ def run(
             file=sys.stderr,
         )
 
-    # --------------------------------------------------------
-    # Final weight checks again
-    # --------------------------------------------------------
-
     for etf, group in (
         combined.groupby(
             "fund_ticker",
@@ -5390,9 +5321,54 @@ def run(
 
             return 1
 
-    # --------------------------------------------------------
-    # Atomic publication
-    # --------------------------------------------------------
+    # Extra final ACWI precision safeguard.
+    #
+    # Even if another code path changes later, ACWI must have
+    # materially more precision than a 2dp provider export.
+    if "ACWI" in expected_funds:
+
+        acwi = combined[
+            combined[
+                "fund_ticker"
+            ].eq("ACWI")
+        ].copy()
+
+        acwi_weights = pd.to_numeric(
+            acwi["weight"],
+            errors="coerce",
+        ).dropna()
+
+        if not acwi_weights.empty:
+
+            # A value differs from its 2dp rounding if genuine
+            # reconstructed precision is present.
+            higher_precision = (
+                (
+                    acwi_weights
+                    -
+                    acwi_weights.round(2)
+                )
+                .abs()
+                > 1e-10
+            )
+
+            high_precision_count = int(
+                higher_precision.sum()
+            )
+
+            # Require meaningful evidence that ACWI was not
+            # published as the rounded provider-weight file.
+            if high_precision_count < 100:
+
+                print(
+                    "ERROR: ACWI appears to have reverted "
+                    "to rounded provider weights. "
+                    f"Only {high_precision_count} holdings "
+                    "contain precision beyond 2 decimals.",
+                    file=sys.stderr,
+                )
+
+                return 1
 
     write_csv_atomic(
         combined,
@@ -5517,7 +5493,6 @@ def main() -> int:
             DEFAULT_ETFS.copy()
         )
 
-    # Deduplicate while preserving order.
     etfs = list(
         dict.fromkeys(
             etfs
