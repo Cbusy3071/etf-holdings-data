@@ -34,15 +34,15 @@ jobs:
 
       - name: Check Python syntax
         run: |
+          python -m py_compile update_holdings_base.py
           python -m py_compile update_holdings.py
-          python -m py_compile update_holdings_fixed_all.py
 
       - name: Create output directory
         run: mkdir -p data
 
       - name: Download ETF holdings
         run: |
-          python update_holdings_fixed_all.py \
+          python update_holdings.py \
             --out-dir data \
             --combined-name ETF_Holdings_Latest.csv \
             VGT ACWI XLF XLI XLC PPH MLPX GRID SOXQ
