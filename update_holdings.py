@@ -8,13 +8,14 @@ Usage:
         VGT ACWI XLF XLI XLC PPH MLPX GRID SOXQ
 
 Dependencies:
-    pip install pandas requests yfinance openpyxl lxml html5lib curl_cffi
+    pip install pandas requests yfinance openpyxl lxml html5lib curl_cffi selenium
 
 Important:
 - This file is fully standalone.
 - It does NOT import update_holdings_base.
 - It does NOT download/exec Python code at runtime.
 - Output schema is kept stable for Power Query.
+- SOXQ production source is Schwab/Wall Street On Demand; Invesco is not required.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ import math
 import os
 import re
 import sys
+import time
 import unicodedata
 
 from dataclasses import dataclass
@@ -101,7 +103,7 @@ PROVIDER_LABELS = {
     "PPH": "VanEck",
     "MLPX": "Global X",
     "GRID": "First Trust",
-    "SOXQ": "Invesco",
+    "SOXQ": "Schwab/WSOD",
 }
 
 MIN_HOLDINGS = {
@@ -122,8 +124,8 @@ MAX_TOTAL_WEIGHT = 103.0
 
 VGT_WARN_DRIFT_DAYS = 10
 VGT_MAX_DRIFT_DAYS = 45
-SOXQ_WARN_DRIFT_DAYS = 7
-SOXQ_MAX_DRIFT_DAYS = 30
+SOXQ_WARN_DRIFT_DAYS = 2
+SOXQ_MAX_DRIFT_DAYS = 5
 
 MAX_UNPRICED_FALLBACK_WEIGHT = {
     "VGT": 0.10,
@@ -147,23 +149,10 @@ VANGUARD_URL = (
     "{ticker}/portfolio-holding/stock"
 )
 
-INVESCO_PAGE_URL = (
-    "https://www.invesco.com/us/en/financial-products/"
-    "etfs/invesco-phlx-semiconductor-etf.html"
+SCHWAB_SOXQ_URL = (
+    "https://www.schwab.wallst.com/schwab/Prospect/research/etfs/"
+    "schwabETF/index.asp?type=holdings&symbol={ticker}"
 )
-
-INVESCO_EXPORT_URLS = [
-    (
-        "https://www.invesco.com/us/financial-products/"
-        "etfs/holdings/main/holdings/0"
-        "?audienceType=Investor&action=download&ticker={ticker}"
-    ),
-    (
-        "https://www.invesco.com/us/en/financial-products/"
-        "etfs/holdings/main/holdings/0"
-        "?audienceType=Investor&action=download&ticker={ticker}"
-    ),
-]
 
 GLOBALX_PAGE_URL = "https://www.globalxetfs.com/funds/{ticker}"
 
@@ -1652,407 +1641,677 @@ def fetch_ssga(
     )
 
 
-def _discover_invesco_urls(
-    html_text: str,
-    base_url: str,
-) -> list[str]:
-    found: list[str] = []
 
-    for text_tokens, href_tokens in (
-        (("export",), ()),
-        (("download",), ("holding",)),
-        ((), ("holdings",)),
+def parse_compact_number(value: Any) -> float | None:
+    """
+    Parse Schwab compact numeric values such as:
+        739.2K, 1.9M, $403.0M, 13.45%
+
+    Returns the numeric value in base units.
+    """
+    if value is None:
+        return None
+
+    text_value = clean_text(value).upper().strip()
+
+    if (
+        not text_value
+        or text_value in {"-", "--", "N/A", "NA", "NONE"}
     ):
-        url = find_download_link(
-            html_text,
-            base_url,
-            text_contains=text_tokens,
-            href_contains=href_tokens,
+        return None
+
+    negative = (
+        text_value.startswith("(")
+        and text_value.endswith(")")
+    )
+
+    text_value = (
+        text_value
+        .replace("$", "")
+        .replace(",", "")
+        .replace("%", "")
+        .strip("() ")
+    )
+
+    multiplier = 1.0
+
+    if text_value.endswith("K"):
+        multiplier = 1_000.0
+        text_value = text_value[:-1]
+    elif text_value.endswith("M"):
+        multiplier = 1_000_000.0
+        text_value = text_value[:-1]
+    elif text_value.endswith("B"):
+        multiplier = 1_000_000_000.0
+        text_value = text_value[:-1]
+    elif text_value.endswith("T"):
+        multiplier = 1_000_000_000_000.0
+        text_value = text_value[:-1]
+
+    try:
+        number = float(text_value) * multiplier
+    except ValueError:
+        return None
+
+    return -number if negative else number
+
+
+def _schwab_source_date(page_text: str) -> str | None:
+    """
+    Prefer the Schwab 'As of close MM/DD/YYYY' date.
+
+    This is the holdings/reporting date we expose as source_date. It is
+    intentionally different from retrieved_at_utc.
+    """
+    match = re.search(
+        r"(?i)\bAs\s+of(?:\s+close)?"
+        r"(?:\s+\d{1,2}:\d{2}\s*(?:am|pm)\s*ET)?"
+        r"\s+(\d{1,2}/\d{1,2}/20\d{2})\b",
+        page_text,
+    )
+
+    if match:
+        parsed = normalize_date_value(match.group(1))
+        if parsed:
+            return parsed
+
+    return extract_date_from_text(page_text)
+
+
+def _schwab_rows_from_driver(driver: Any) -> list[dict[str, Any]]:
+    """
+    Read the currently visible Schwab holdings table.
+
+    The table has five columns:
+        Symbol, Description, Weight, Shares Held, Market Value
+    """
+    from selenium.webdriver.common.by import By
+
+    rows: list[dict[str, Any]] = []
+
+    for row in driver.find_elements(
+        By.CSS_SELECTOR,
+        "#tthHoldingsTbody tr",
+    ):
+        cells = row.find_elements(
+            By.TAG_NAME,
+            "td",
         )
 
-        if url:
-            found.append(
-                url
+        if len(cells) < 5:
+            continue
+
+        symbol = clean_text(cells[0].text)
+        name = clean_text(cells[1].text)
+        weight = to_float(cells[2].text)
+        shares = parse_compact_number(cells[3].text)
+        market_value = parse_compact_number(cells[4].text)
+
+        if not symbol and not name:
+            continue
+
+        rows.append(
+            {
+                "raw_ticker": symbol,
+                "raw_name": name,
+                "weight": weight,
+                "shares": shares,
+                "market_value": market_value,
+                "isin": "",
+                "sedol": "",
+            }
+        )
+
+    return rows
+
+
+def _schwab_click_show_60(
+    driver: Any,
+    timeout: int,
+) -> None:
+    """
+    Ask Schwab to show up to 60 rows so SOXQ normally fits on one page.
+
+    Failure is non-fatal because fetch_schwab_soxq also has a pagination
+    fallback.
+    """
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    try:
+        pagination = driver.find_element(
+            By.ID,
+            "PaginationContainer",
+        )
+
+        links = pagination.find_elements(
+            By.TAG_NAME,
+            "a",
+        )
+
+        target = None
+
+        for link in links:
+            if clean_text(link.text) == "60":
+                target = link
+                break
+
+        if target is None:
+            return
+
+        before_count = len(
+            driver.find_elements(
+                By.CSS_SELECTOR,
+                "#tthHoldingsTbody tr",
             )
+        )
 
-    patterns = [
-        (
-            r'https?://[^"\'<>\\\s]+'
-            r'(?:holding|holdings)'
-            r'[^"\'<>\\\s]*'
-        ),
-        (
-            r'(?P<url>/us/(?:en/)?financial-products/'
-            r'etfs/holdings/[^"\'<>\\\s]+)'
-        ),
-    ]
+        driver.execute_script(
+            "arguments[0].click();",
+            target,
+        )
 
-    for pattern in patterns:
-        for match in re.finditer(
-            pattern,
-            html_text,
-            flags=re.IGNORECASE,
+        WebDriverWait(
+            driver,
+            min(max(timeout, 5), 30),
+        ).until(
+            lambda active_driver:
+            len(
+                active_driver.find_elements(
+                    By.CSS_SELECTOR,
+                    "#tthHoldingsTbody tr",
+                )
+            )
+            > before_count
+        )
+
+    except Exception:
+        return
+
+
+def _schwab_collect_all_rows(
+    driver: Any,
+    timeout: int,
+) -> list[dict[str, Any]]:
+    """
+    Collect every Schwab holdings row.
+
+    First tries the 'Show 60' control. If Schwab leaves the table paginated,
+    follows Next links and deduplicates the result.
+    """
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    page_text = driver.find_element(
+        By.TAG_NAME,
+        "body",
+    ).text
+
+    total_match = re.search(
+        r"(?i)\bof\s+(\d+)\s+matches\b",
+        page_text,
+    )
+
+    expected_rows = (
+        int(total_match.group(1))
+        if total_match
+        else None
+    )
+
+    _schwab_click_show_60(
+        driver,
+        timeout,
+    )
+
+    time.sleep(0.5)
+
+    collected: dict[
+        tuple[str, str],
+        dict[str, Any],
+    ] = {}
+
+    def absorb_visible() -> int:
+        added = 0
+
+        for row in _schwab_rows_from_driver(
+            driver
         ):
-            value = (
-                match.groupdict().get("url")
-                if match.groupdict()
-                else match.group(0)
+            key = (
+                clean_text(row["raw_ticker"]).upper(),
+                normalized_name(
+                    row["raw_name"]
+                ),
             )
 
-            value = (
-                (value or "")
-                .replace("\\/", "/")
-                .replace("&amp;", "&")
-            )
+            if key not in collected:
+                added += 1
 
-            if value:
-                found.append(
-                    urljoin(
-                        base_url,
-                        value,
+            collected[key] = row
+
+        return added
+
+    absorb_visible()
+
+    if (
+        expected_rows is None
+        or len(collected) >= expected_rows
+    ):
+        return list(
+            collected.values()
+        )
+
+    # Pagination fallback. SOXQ currently needs only two pages, but cap the
+    # loop so a site-layout bug cannot hang the workflow.
+    for _ in range(5):
+        pagination = driver.find_element(
+            By.ID,
+            "PaginationContainer",
+        )
+
+        next_link = None
+
+        for link in pagination.find_elements(
+            By.TAG_NAME,
+            "a",
+        ):
+            if "next" in clean_text(
+                link.text
+            ).lower():
+                parent_class = clean_text(
+                    link.find_element(
+                        By.XPATH,
+                        "..",
+                    ).get_attribute(
+                        "class"
                     )
+                ).lower()
+
+                if "disabled" not in parent_class:
+                    next_link = link
+
+                break
+
+        if next_link is None:
+            break
+
+        before_keys = set(
+            collected
+        )
+
+        old_first_symbol = ""
+
+        current_rows = driver.find_elements(
+            By.CSS_SELECTOR,
+            "#tthHoldingsTbody tr",
+        )
+
+        if current_rows:
+            cells = current_rows[0].find_elements(
+                By.TAG_NAME,
+                "td",
+            )
+
+            if cells:
+                old_first_symbol = clean_text(
+                    cells[0].text
                 )
 
-    def score(url: str) -> tuple[int, int]:
-        lowered = url.lower()
-        points = 0
+        driver.execute_script(
+            "arguments[0].click();",
+            next_link,
+        )
 
-        if "action=download" in lowered:
-            points += 5
+        try:
+            WebDriverWait(
+                driver,
+                min(max(timeout, 5), 30),
+            ).until(
+                lambda active_driver:
+                (
+                    len(
+                        active_driver.find_elements(
+                            By.CSS_SELECTOR,
+                            "#tthHoldingsTbody tr",
+                        )
+                    )
+                    > 0
+                    and
+                    (
+                        not old_first_symbol
+                        or clean_text(
+                            active_driver.find_elements(
+                                By.CSS_SELECTOR,
+                                "#tthHoldingsTbody tr",
+                            )[0]
+                            .find_elements(
+                                By.TAG_NAME,
+                                "td",
+                            )[0]
+                            .text
+                        )
+                        != old_first_symbol
+                    )
+                )
+            )
+        except Exception:
+            pass
 
-        if "ticker=" in lowered:
-            points += 3
+        time.sleep(0.5)
 
-        if "holding" in lowered:
-            points += 2
+        absorb_visible()
 
-        if lowered.endswith(
-            (".csv", ".xls", ".xlsx")
+        if set(collected) == before_keys:
+            break
+
+        if (
+            expected_rows is not None
+            and len(collected) >= expected_rows
         ):
-            points += 2
+            break
 
-        return points, -len(url)
-
-    return sorted(
-        dict.fromkeys(found),
-        key=score,
-        reverse=True,
+    return list(
+        collected.values()
     )
 
 
-def _parse_invesco_response(
-    response: Any,
-    *,
-    source_date_hint: str,
+def _schwab_reconstruct_shares(
+    frame: pd.DataFrame,
+) -> tuple[pd.DataFrame, int]:
+    """
+    Replace Schwab's rounded compact share figures with effective share counts
+    inferred from:
+        Schwab market value / Yahoo latest close
+
+    The scheduled workflow runs just after the US close, so the latest Yahoo
+    close corresponds to the same close Schwab reports. Market values are
+    rounded, so these are still estimates, but they are much more precise than
+    a displayed value such as '1.9M'.
+    """
+    output = frame.copy()
+
+    prices = yahoo_latest_prices(
+        output[
+            "raw_ticker"
+        ].map(clean_text)
+    )
+
+    reconstructed = 0
+
+    for index in output.index:
+        ticker = clean_text(
+            output.at[
+                index,
+                "raw_ticker",
+            ]
+        )
+
+        market_value = to_float(
+            output.at[
+                index,
+                "market_value",
+            ]
+        )
+
+        price = prices.get(
+            ticker
+        )
+
+        if (
+            market_value is None
+            or market_value <= 0
+            or price is None
+            or price <= 0
+        ):
+            continue
+
+        output.at[
+            index,
+            "shares",
+        ] = (
+            market_value
+            / price
+        )
+
+        reconstructed += 1
+
+    return (
+        output,
+        reconstructed,
+    )
+
+
+def fetch_schwab_soxq(
+    session: requests.Session,
+    etf: str,
+    timeout: int,
 ) -> FetchResult:
-    parsed, source_date = parse_download(
-        response,
-        provider="Invesco",
-        source_date_hint=source_date_hint,
+    """
+    Permanent SOXQ source replacement.
+
+    Schwab/Wall Street On Demand publishes the full holdings table with:
+        symbol, description, portfolio weight, shares held, market value.
+
+    Selenium is used because the full table is paginated client-side. Invesco
+    is deliberately NOT part of this production path.
+    """
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.service import Service
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+    except Exception as exc:
+        raise HoldingsError(
+            "SOXQ: selenium is required for Schwab/WSOD holdings"
+        ) from exc
+
+    url = SCHWAB_SOXQ_URL.format(
+        ticker=etf
     )
 
-    result_all = standardise(
-        parsed,
-        ticker=pick_col(
-            parsed,
-            [
-                "holding ticker",
-                "ticker",
-                "symbol",
-            ],
-        ),
-        name=pick_col(
-            parsed,
-            [
-                "holding name",
-                "name",
-                "security",
-                "description",
-                "holding",
-            ],
-        ),
-        weight=pick_col(
-            parsed,
-            [
-                "weight",
-                "% of fund",
-                "% of net",
-                "%",
-            ],
-        ),
-        shares=pick_col(
-            parsed,
-            [
-                "shares held",
-                "shares",
-                "quantity",
-            ],
-        ),
-        mval=pick_col(
-            parsed,
-            [
-                "market value",
-                "marketvalue",
-            ],
-        ),
-        isin=pick_col(
-            parsed,
-            [
-                "isin",
-                "security identifier",
-            ],
-        ),
-        sedol=pick_col(
-            parsed,
-            ["sedol"],
-        ),
+    options = webdriver.ChromeOptions()
+    options.add_argument(
+        "--headless=new"
+    )
+    options.add_argument(
+        "--no-sandbox"
+    )
+    options.add_argument(
+        "--disable-dev-shm-usage"
+    )
+    options.add_argument(
+        "--disable-gpu"
+    )
+    options.add_argument(
+        "--window-size=1920,1080"
+    )
+    options.add_argument(
+        "--lang=en-US"
+    )
+    options.add_argument(
+        f"--user-agent={HEADERS['User-Agent']}"
     )
 
+    chrome_binary = os.environ.get(
+        "CHROME_BIN"
+    )
+
+    if chrome_binary:
+        options.binary_location = (
+            chrome_binary
+        )
+
+    chromedriver_binary = os.environ.get(
+        "CHROMEDRIVER"
+    )
+
+    service = (
+        Service(
+            executable_path=chromedriver_binary
+        )
+        if chromedriver_binary
+        else Service()
+    )
+
+    driver = None
+
+    try:
+        driver = webdriver.Chrome(
+            service=service,
+            options=options,
+        )
+
+        driver.set_page_load_timeout(
+            max(
+                30,
+                timeout,
+            )
+        )
+
+        driver.get(
+            url
+        )
+
+        WebDriverWait(
+            driver,
+            min(
+                max(
+                    timeout,
+                    10,
+                ),
+                45,
+            ),
+        ).until(
+            EC.presence_of_element_located(
+                (
+                    By.ID,
+                    "tthHoldingsTbody",
+                )
+            )
+        )
+
+        page_text = driver.find_element(
+            By.TAG_NAME,
+            "body",
+        ).text
+
+        source_date = (
+            _schwab_source_date(
+                page_text
+            )
+            or iso_today()
+        )
+
+        rows = _schwab_collect_all_rows(
+            driver,
+            timeout,
+        )
+
+    except Exception as exc:
+        raise HoldingsError(
+            f"SOXQ: Schwab/WSOD holdings fetch failed: {exc}"
+        ) from exc
+
+    finally:
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+    if len(rows) < MIN_HOLDINGS[
+        etf
+    ]:
+        raise HoldingsError(
+            f"SOXQ: Schwab returned only {len(rows)} total rows"
+        )
+
+    result_all = pd.DataFrame(
+        rows,
+        columns=STD_COLS,
+    )
+
+    provider_weights = pd.to_numeric(
+        result_all[
+            "weight"
+        ],
+        errors="coerce",
+    )
+
+    # Schwab's displayed market values are rounded, but they still provide a
+    # better denominator than 2dp displayed weights. Recompute from all rows
+    # BEFORE removing cash/non-security rows.
     result_all, precision = recompute_weights(
         result_all,
         require_all_market_values=False,
     )
 
+    recomputed_weights = pd.to_numeric(
+        result_all[
+            "weight"
+        ],
+        errors="coerce",
+    )
+
+    comparison = (
+        provider_weights.notna()
+        & recomputed_weights.notna()
+    )
+
+    if comparison.any():
+        max_gap = float(
+            (
+                provider_weights.loc[
+                    comparison
+                ]
+                -
+                recomputed_weights.loc[
+                    comparison
+                ]
+            )
+            .abs()
+            .max()
+        )
+
+        if max_gap > 0.20:
+            raise HoldingsError(
+                "SOXQ: Schwab market-value and provider weights "
+                f"disagree by as much as {max_gap:.4f} percentage points"
+            )
+
     result = drop_nonsecurity_rows(
         result_all
     )
 
-    return FetchResult(
-        frame=result,
-        source_date=(
-            source_date
-            or source_date_hint
-        ),
-        precision_method=precision,
+    result, reconstructed = (
+        _schwab_reconstruct_shares(
+            result
+        )
     )
 
-
-def fetch_invesco(
-    session: requests.Session,
-    etf: str,
-    timeout: int,
-) -> FetchResult:
-    errors: list[str] = []
-    source_date = iso_today()
-    candidates: list[str] = []
-
-    try:
-        page = session.get(
-            INVESCO_PAGE_URL,
-            headers={
-                **HEADERS,
-                "Accept": HTML_ACCEPT,
-                "Upgrade-Insecure-Requests": "1",
-            },
-            timeout=(10, timeout),
-            allow_redirects=True,
+    if len(result) < MIN_HOLDINGS[
+        etf
+    ]:
+        raise HoldingsError(
+            f"SOXQ: only {len(result)} security rows after cleanup"
         )
-
-        if (
-            page.status_code == 200
-            and len(page.content) >= 100
-        ):
-            source_date = (
-                extract_date_from_text(
-                    page.text[:50000]
-                )
-                or source_date
-            )
-
-            candidates.extend(
-                _discover_invesco_urls(
-                    page.text,
-                    str(page.url),
-                )
-            )
-
-        else:
-            errors.append(
-                f"requests page HTTP {page.status_code}, "
-                f"{len(page.content)} bytes"
-            )
-
-    except Exception as exc:
-        errors.append(
-            f"requests page: {type(exc).__name__}: {exc}"
-        )
-
-    candidates.extend(
-        url.format(
-            ticker=etf
-        )
-        for url in INVESCO_EXPORT_URLS
-    )
-
-    for url in dict.fromkeys(
-        candidates
-    ):
-        try:
-            response = session.get(
-                url,
-                headers={
-                    **HEADERS,
-                    "Referer": INVESCO_PAGE_URL,
-                    "Accept": DOWNLOAD_ACCEPT,
-                },
-                timeout=(10, timeout),
-                allow_redirects=True,
-            )
-
-            if (
-                response.status_code != 200
-                or len(response.content) < 100
-            ):
-                errors.append(
-                    f"requests export HTTP {response.status_code}, "
-                    f"{len(response.content)} bytes"
-                )
-                continue
-
-            return _parse_invesco_response(
-                response,
-                source_date_hint=source_date,
-            )
-
-        except Exception as exc:
-            errors.append(
-                f"requests export: {type(exc).__name__}: {exc}"
-            )
 
     print(
-        "[SOXQ] Standard Invesco path failed; "
-        "retrying with curl_cffi...",
+        "[SOXQ] Schwab/WSOD full composition: "
+        f"{len(result)} securities, "
+        f"source_date={source_date}, "
+        f"reconstructed_shares={reconstructed}",
         file=sys.stderr,
     )
 
-    try:
-        from curl_cffi import requests as cffi_requests
-
-        browser = cffi_requests.Session(
-            impersonate="chrome",
-            headers={
-                "Accept-Language": "en-US,en;q=0.9",
-                "Cache-Control": "no-cache",
-                "Pragma": "no-cache",
-            },
-        )
-
-        try:
-            try:
-                browser.get(
-                    "https://www.invesco.com/us/",
-                    headers={
-                        "Accept": HTML_ACCEPT,
-                    },
-                    timeout=timeout,
-                    allow_redirects=True,
-                )
-            except Exception:
-                pass
-
-            browser_source_date = (
-                source_date
-            )
-
-            browser_candidates: list[str] = []
-
-            try:
-                page = browser.get(
-                    INVESCO_PAGE_URL,
-                    headers={
-                        "Accept": HTML_ACCEPT,
-                        "Upgrade-Insecure-Requests": "1",
-                    },
-                    timeout=timeout,
-                    allow_redirects=True,
-                )
-
-                if (
-                    page.status_code == 200
-                    and len(page.content) >= 100
-                ):
-                    browser_source_date = (
-                        extract_date_from_text(
-                            page.text[:50000]
-                        )
-                        or browser_source_date
-                    )
-
-                    browser_candidates.extend(
-                        _discover_invesco_urls(
-                            page.text,
-                            str(page.url),
-                        )
-                    )
-
-                else:
-                    errors.append(
-                        f"curl page HTTP {page.status_code}, "
-                        f"{len(page.content)} bytes"
-                    )
-
-            except Exception as exc:
-                errors.append(
-                    f"curl page: {type(exc).__name__}: {exc}"
-                )
-
-            browser_candidates.extend(
-                url.format(
-                    ticker=etf
-                )
-                for url in INVESCO_EXPORT_URLS
-            )
-
-            for url in dict.fromkeys(
-                browser_candidates
-            ):
-                try:
-                    response = browser.get(
-                        url,
-                        headers={
-                            "Referer": INVESCO_PAGE_URL,
-                            "Accept": DOWNLOAD_ACCEPT,
-                        },
-                        timeout=timeout,
-                        allow_redirects=True,
-                    )
-
-                    if (
-                        response.status_code != 200
-                        or len(response.content) < 100
-                    ):
-                        errors.append(
-                            f"curl export HTTP {response.status_code}, "
-                            f"{len(response.content)} bytes"
-                        )
-                        continue
-
-                    return _parse_invesco_response(
-                        response,
-                        source_date_hint=browser_source_date,
-                    )
-
-                except Exception as exc:
-                    errors.append(
-                        f"curl export: {type(exc).__name__}: {exc}"
-                    )
-
-        finally:
-            try:
-                browser.close()
-            except Exception:
-                pass
-
-    except Exception as exc:
-        errors.append(
-            f"curl_cffi: {type(exc).__name__}: {exc}"
-        )
-
-    raise HoldingsError(
-        f"{etf}: Invesco unavailable: "
-        + " | ".join(errors[-8:])
+    return FetchResult(
+        frame=result,
+        source_date=source_date,
+        precision_method=(
+            "schwab_wsod_market_value"
+            f"_shares_rebuilt_{reconstructed}"
+        ),
     )
-
 
 def fetch_globalx(
     session: requests.Session,
@@ -2962,15 +3221,21 @@ def drift_previous_snapshot(
         warn_days = SOXQ_WARN_DRIFT_DAYS
         max_days = SOXQ_MAX_DRIFT_DAYS
 
+    snapshot_source = (
+        "Vanguard"
+        if fund == "VGT"
+        else "Schwab/WSOD"
+    )
+
     if age > max_days:
         raise HoldingsError(
-            f"{fund}: official composition is {age} days old; "
+            f"{fund}: {snapshot_source} composition is {age} days old; "
             f"refusing to drift past {max_days} days"
         )
 
     if age > warn_days:
         print(
-            f"[{fund}] WARNING: official composition "
+            f"[{fund}] WARNING: {snapshot_source} composition "
             f"snapshot is {age} days old",
             file=sys.stderr,
         )
@@ -3402,7 +3667,7 @@ FETCHERS: dict[
     "PPH": fetch_vaneck,
     "MLPX": fetch_globalx,
     "GRID": fetch_firsttrust,
-    "SOXQ": fetch_invesco,
+    "SOXQ": fetch_schwab_soxq,
 }
 
 DEFAULT_ETFS = [
@@ -3627,7 +3892,9 @@ def run(
                 )
 
                 fallback_mode = (
-                    "last official shares x live Yahoo prices"
+                    "last Vanguard shares x live Yahoo prices"
+                    if etf == "VGT"
+                    else "last Schwab/WSOD shares x live Yahoo prices"
                 )
 
             else:
