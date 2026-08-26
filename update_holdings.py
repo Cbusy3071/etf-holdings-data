@@ -1591,9 +1591,12 @@ def fetch_ssga(
         timeout,
     )
 
+    # State Street workbooks contain metadata rows that may mention "ticker".
+    # Requiring BOTH ticker and weight prevents selecting a metadata row as
+    # the holdings header (which otherwise produces rows with zero weights).
     frame, source_date = excel_with_detected_header(
         response.content,
-        required_tokens=("ticker",),
+        required_tokens=("ticker", "weight"),
     )
 
     result = standardise(
@@ -3628,11 +3631,10 @@ def run(
                 )
 
             else:
-                fallback = generic_market_value_backfill(
-                    fallback,
-                    retrieved_at=retrieved_at,
-                )
-
+                # Provider-weight funds already have a validated last-known-good
+                # snapshot. Do not Yahoo-backfill blank market values here:
+                # State Street files can contain derivative tickers such as
+                # IXIU6/XASU6 that Yahoo does not quote.
                 fallback_mode = (
                     "last-known-good"
                 )
