@@ -1,7 +1,7 @@
 """
 Provider reliability patch for the existing ETF holdings pipeline.
 
-This file imports the existing `update_holdings.py` and replaces only the
+This file imports the existing pipeline as `update_holdings_base.py` and replaces only the
 provider/fallback paths that were failing in GitHub Actions: VGT, ACWI and SOXQ.
 The other six ETF paths remain unchanged.
 
@@ -46,9 +46,9 @@ What this fixes
    - warns when drifted VGT/SOXQ share snapshots become old;
    - refuses to drift SOXQ beyond 30 days and VGT beyond 45 days.
 
-Run it with the same CLI arguments as update_holdings.py, e.g.:
+Run it with the normal production filename, e.g.:
 
-    python update_holdings_fixed.py \
+    python update_holdings.py \
       --out-dir data \
       --combined-name ETF_Holdings_Latest.csv \
       VGT ACWI XLF XLI XLC PPH MLPX GRID SOXQ
@@ -68,7 +68,7 @@ from urllib.parse import urljoin
 
 import pandas as pd
 
-import update_holdings as base
+import update_holdings_base as base
 
 
 SOXQ_MAX_DRIFT_DAYS = 30
@@ -1304,8 +1304,7 @@ def fill_output_market_values_from_yahoo_fixed(
     )
 
 
-# Monkeypatch the existing pipeline. Functions in base.run() resolve these names
-# from the update_holdings module at runtime, so the rest of the code is reused.
+# Patch the imported base pipeline while preserving the production entrypoint name update_holdings.py.
 base.fetch_vanguard = fetch_vanguard_fixed
 base.fetch_ishares = fetch_ishares_fixed
 base.fetch_invesco = fetch_invesco_fixed
