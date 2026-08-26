@@ -33,9 +33,7 @@ jobs:
           pip install pandas requests yfinance openpyxl lxml html5lib curl_cffi
 
       - name: Check Python syntax
-        run: |
-          python -m py_compile update_holdings_base.py
-          python -m py_compile update_holdings.py
+        run: python -m py_compile update_holdings.py
 
       - name: Create output directory
         run: mkdir -p data
@@ -72,7 +70,7 @@ jobs:
 
           expected_funds = {
               "VGT", "ACWI", "XLF", "XLI", "XLC",
-              "PPH", "MLPX", "GRID", "SOXQ"
+              "PPH", "MLPX", "GRID", "SOXQ",
           }
 
           if list(df.columns) != expected_columns:
@@ -80,14 +78,19 @@ jobs:
                   f"Unexpected CSV columns: {list(df.columns)}"
               )
 
-          actual_funds = set(df["fund_ticker"].dropna().unique())
+          actual_funds = set(
+              df["fund_ticker"].dropna().astype(str).unique()
+          )
 
           if actual_funds != expected_funds:
               raise SystemExit(
                   f"ETF mismatch. Expected {expected_funds}, got {actual_funds}"
               )
 
-          print(f"Validated {len(df):,} rows across {len(actual_funds)} ETFs")
+          print(
+              f"Validated {len(df):,} rows "
+              f"across {len(actual_funds)} ETFs"
+          )
 
           for ticker, group in df.groupby("fund_ticker"):
               print(
@@ -95,7 +98,6 @@ jobs:
                   len(group),
                   f"weight={group['weight'].sum():.8f}%",
                   f"source_date={group['source_date'].iloc[0]}",
-                  f"retrieved_at={group['retrieved_at_utc'].iloc[0]}",
               )
           PY
 
@@ -105,9 +107,9 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           cp data/ETF_Holdings_Latest.csv /tmp/ETF_Holdings_Latest.csv
+
           git fetch origin main
 
-          # Do not let a run started from old code publish after main changed.
           if [ "$(git rev-parse origin/main)" != "$GITHUB_SHA" ]; then
             echo "Main changed while this workflow was running."
             echo "Refusing to publish output generated from stale code."
