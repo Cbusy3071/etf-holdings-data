@@ -47,7 +47,7 @@ from lxml import html as lxml_html
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-SCRIPT_REVISION = "2026-08-31-vgt-advisor-v2"
+SCRIPT_REVISION = "2026-08-31-vgt-api-v3"
 
 DEFAULT_OUT_DIR = Path("data")
 DEFAULT_COMBINED_NAME = "ETF_Holdings_Latest.csv"
@@ -139,6 +139,18 @@ VANGUARD_API_URL = (
     "https://investor.vanguard.com/investment-products/etfs/profile/api/"
     "{ticker}/portfolio-holding/stock"
 )
+
+# Vanguard's current public holdings endpoint is sensitive to request shape.
+# Use an uppercase ticker, explicit pagination, and a browser-like UA.
+VANGUARD_API_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+VANGUARD_API_PARAMS = {
+    "start": "1",
+    "count": "50000",
+}
 VANGUARD_PROFILE_URL = (
     "https://investor.vanguard.com/investment-products/etfs/profile/{ticker}"
 )
@@ -286,6 +298,20 @@ def normalize_date_value(value: Any) -> str | None:
     text = clean_text(value)
     if not text:
         return None
+
+    # Vanguard commonly returns ISO timestamps such as
+    # 2026-07-31T00:00:00-04:00. Keep the reported calendar day and do not
+    # timezone-shift it.
+    iso_prefix = re.match(r"^(20\d{2}-\d{1,2}-\d{1,2})(?:T|\s|$)", text)
+    if iso_prefix:
+        try:
+            return datetime.strptime(
+                iso_prefix.group(1),
+                "%Y-%m-%d",
+            ).date().isoformat()
+        except ValueError:
+            pass
+
     for pattern, fmt in (
         (r"\b20\d{2}-\d{1,2}-\d{1,2}\b", "%Y-%m-%d"),
         (r"\b\d{1,2}/\d{1,2}/20\d{2}\b", "%m/%d/%Y"),
@@ -1295,67 +1321,169 @@ def _fetch_vanguard_advisor_dom(etf: str, timeout: int) -> FetchResult:
             except Exception:
                 pass
 
-def _fetch_vanguard_legacy_api(
+def _vanguard_json_response(
+    response: Any,
+    *,
+    etf: str,
+    transport: str,
+) -> Any:
+    """Validate/decode Vanguard JSON and expose HTML interstitials clearly."""
+    status = int(getattr(response, "status_code", 0) or 0)
+    content_type = str(
+        getattr(response, "headers", {}).get("content-type", "")
+    ).lower()
+    raw_text = str(getattr(response, "text", "") or "")
+    stripped = raw_text.lstrip()
+
+    if status != 200:
+        preview = re.sub(r"\s+", " ", raw_text[:220]).strip()
+        raise HoldingsError(
+            f"VGT: Vanguard {transport} HTTP {status}; "
+            f"content-type={content_type}; body={preview!r}"
+        )
+
+    looks_json = (
+        "json" in content_type
+        or stripped.startswith("{")
+        or stripped.startswith("[")
+    )
+    if not looks_json:
+        preview = re.sub(r"\s+", " ", raw_text[:220]).strip()
+        raise HoldingsError(
+            f"VGT: Vanguard {transport} returned non-JSON content; "
+            f"content-type={content_type}; body={preview!r}"
+        )
+
+    try:
+        return response.json()
+    except Exception as exc:
+        preview = re.sub(r"\s+", " ", raw_text[:220]).strip()
+        raise HoldingsError(
+            f"VGT: Vanguard {transport} JSON decode failed: {exc}; "
+            f"body={preview!r}"
+        ) from exc
+
+
+def _fetch_vanguard_current_api(
     session: requests.Session,
     etf: str,
     timeout: int,
 ) -> FetchResult:
-    """Legacy fallback only; the Advisor export is the preferred source."""
-    api_url = VANGUARD_API_URL.format(ticker=etf.lower())
-    profile_url = VANGUARD_PROFILE_URL.format(ticker=etf.lower())
+    """
+    Primary VGT source: Vanguard's current keyless public holdings JSON API.
+
+    Critical request details:
+      * UPPERCASE ticker in the URL
+      * ?start=1&count=50000
+      * browser User-Agent
+      * Accept: application/json
+
+    Provider weights are returned directly by Vanguard. Nothing is repriced.
+    """
+    ticker = etf.strip().upper()
+    api_url = VANGUARD_API_URL.format(ticker=ticker)
+    headers = {
+        "User-Agent": VANGUARD_API_USER_AGENT,
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
     errors: list[str] = []
 
     try:
         response = session.get(
             api_url,
-            headers={
-                **HEADERS,
-                "Accept": "application/json,text/plain,*/*",
-                "Referer": profile_url,
-            },
+            params=VANGUARD_API_PARAMS,
+            headers=headers,
             timeout=(10, timeout),
             allow_redirects=True,
         )
-        content_type = str(response.headers.get("content-type", "")).lower()
-        if (
-            response.status_code == 200
-            and len(response.content) >= 100
-            and "json" in content_type
-        ):
-            return parse_vanguard_payload(response.json(), etf)
-        errors.append(
-            f"requests HTTP {response.status_code}, content-type={content_type}, "
-            f"{len(response.content)} bytes"
+        payload = _vanguard_json_response(
+            response,
+            etf=etf,
+            transport="requests",
         )
+        source_date_hint = None
+        if isinstance(payload, dict):
+            source_date_hint = normalize_date_value(
+                payload.get("asOfDate")
+                or payload.get("asofDate")
+                or payload.get("as_of_date")
+            )
+        result = parse_vanguard_payload(
+            payload,
+            etf,
+            source_date_hint=source_date_hint,
+        )
+
+        expected = None
+        if isinstance(payload, dict):
+            expected = to_float(payload.get("size"))
+        if expected is not None and int(expected) >= MIN_HOLDINGS[etf]:
+            # We ask for 50,000 rows, so receiving fewer than the fund's own
+            # advertised size is suspicious. Allow non-security rows to explain
+            # a tiny difference, but never a materially truncated response.
+            if len(result.frame) < max(MIN_HOLDINGS[etf], int(expected) - 10):
+                raise HoldingsError(
+                    f"VGT: Vanguard JSON advertises size={int(expected)} but "
+                    f"only {len(result.frame)} security rows parsed"
+                )
+
+        print(
+            f"[VGT] Vanguard public API: {len(result.frame)} securities, "
+            f"source_date={result.source_date}",
+            file=sys.stderr,
+        )
+        result.precision_method = "vanguard_public_api_provider_weight"
+        return result
+
     except Exception as exc:
         errors.append(f"requests: {type(exc).__name__}: {exc}")
+        print(
+            f"[VGT] Public API requests path failed; retrying with curl_cffi: {exc}",
+            file=sys.stderr,
+        )
 
     try:
         from curl_cffi import requests as cffi_requests
 
-        browser = cffi_requests.Session(impersonate="chrome")
+        browser = cffi_requests.Session(
+            impersonate="chrome",
+            headers=headers,
+        )
         try:
-            browser.get(profile_url, timeout=timeout, allow_redirects=True)
             response = browser.get(
                 api_url,
-                headers={
-                    "Accept": "application/json,text/plain,*/*",
-                    "Referer": profile_url,
-                },
+                params=VANGUARD_API_PARAMS,
                 timeout=timeout,
                 allow_redirects=True,
             )
-            content_type = str(response.headers.get("content-type", "")).lower()
-            if (
-                response.status_code == 200
-                and len(response.content) >= 100
-                and "json" in content_type
-            ):
-                return parse_vanguard_payload(response.json(), etf)
-            errors.append(
-                f"curl_cffi HTTP {response.status_code}, content-type={content_type}, "
-                f"{len(response.content)} bytes"
+            payload = _vanguard_json_response(
+                response,
+                etf=etf,
+                transport="curl_cffi",
             )
+            source_date_hint = None
+            if isinstance(payload, dict):
+                source_date_hint = normalize_date_value(
+                    payload.get("asOfDate")
+                    or payload.get("asofDate")
+                    or payload.get("as_of_date")
+                )
+            result = parse_vanguard_payload(
+                payload,
+                etf,
+                source_date_hint=source_date_hint,
+            )
+            print(
+                f"[VGT] Vanguard public API via curl_cffi: "
+                f"{len(result.frame)} securities, "
+                f"source_date={result.source_date}",
+                file=sys.stderr,
+            )
+            result.precision_method = (
+                "vanguard_public_api_curl_cffi_provider_weight"
+            )
+            return result
         finally:
             try:
                 browser.close()
@@ -1364,22 +1492,38 @@ def _fetch_vanguard_legacy_api(
     except Exception as exc:
         errors.append(f"curl_cffi: {type(exc).__name__}: {exc}")
 
-    raise HoldingsError(" | ".join(errors))
+    raise HoldingsError(
+        "VGT: Vanguard public JSON API unavailable: "
+        + " | ".join(errors[-4:])
+    )
 
 
-def fetch_vanguard(session: requests.Session, etf: str, timeout: int) -> FetchResult:
+def fetch_vanguard(
+    session: requests.Session,
+    etf: str,
+    timeout: int,
+) -> FetchResult:
     """
-    VGT authoritative-source policy (revision 2026-08-31-v2):
+    VGT authoritative-source policy (revision 2026-08-31-v3):
 
-    1. Vanguard Advisor 'Export full holdings'.
-    2. Vanguard Advisor rendered holdings table, paginated in Selenium.
-    3. Fail.
+    1. Current Vanguard public JSON holdings API using uppercase ticker and
+       ?start=1&count=50000.
+    2. Vanguard Advisor 'Export full holdings'.
+    3. Vanguard Advisor rendered holdings table.
+    4. Fail.
 
-    The broken investor API is deliberately NOT used. Yahoo is deliberately
-    NOT used to alter VGT weights. This guarantees a reported VGT weight is a
-    Vanguard-published provider weight rather than a synthetic estimate.
+    VGT weights are NEVER generated from Yahoo prices or stale share counts.
     """
     errors: list[str] = []
+
+    try:
+        return _fetch_vanguard_current_api(session, etf, timeout)
+    except Exception as exc:
+        errors.append(f"public API: {type(exc).__name__}: {exc}")
+        print(
+            f"[{etf}] Public Vanguard API failed; trying Advisor export: {exc}",
+            file=sys.stderr,
+        )
 
     try:
         return _fetch_vanguard_advisor_export(etf, timeout)
@@ -1396,8 +1540,8 @@ def fetch_vanguard(session: requests.Session, etf: str, timeout: int) -> FetchRe
         errors.append(f"advisor DOM: {type(exc).__name__}: {exc}")
 
     raise HoldingsError(
-        f"{etf}: authoritative Vanguard holdings unavailable; "
-        + " | ".join(errors[-4:])
+        f"{etf}: authoritative Vanguard holdings unavailable: "
+        + " | ".join(errors[-5:])
     )
 
 
