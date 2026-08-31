@@ -4,12 +4,9 @@ on:
   workflow_dispatch:
 
   schedule:
-    # Early attempt. If provider files are not fresh yet, the freshness gate
-    # below fails the run and nothing is published.
     - cron: "7 7 * * 2-6"
       timezone: "Australia/Sydney"
 
-    # Later retry after providers have had more time to publish daily holdings.
     - cron: "17 18 * * 2-6"
       timezone: "Australia/Sydney"
 
@@ -33,7 +30,7 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Set up Chrome for SOXQ holdings
+      - name: Set up Chrome
         id: chrome
         uses: browser-actions/setup-chrome@v2
         with:
@@ -45,10 +42,12 @@ jobs:
           pip install pandas requests yfinance openpyxl lxml html5lib curl_cffi selenium
 
       - name: Check Python syntax
-        run: python -m py_compile update_holdings.py
+        run: |
+          python -m py_compile update_holdings.py
 
       - name: Create output directory
-        run: mkdir -p data
+        run: |
+          mkdir -p data
 
       - name: Download ETF holdings
         env:
@@ -84,8 +83,15 @@ jobs:
           ]
 
           expected_funds = {
-              "VGT", "ACWI", "XLF", "XLI", "XLC",
-              "PPH", "MLPX", "GRID", "SOXQ",
+              "VGT",
+              "ACWI",
+              "XLF",
+              "XLI",
+              "XLC",
+              "PPH",
+              "MLPX",
+              "GRID",
+              "SOXQ",
           }
 
           if list(df.columns) != expected_columns:
@@ -94,12 +100,16 @@ jobs:
               )
 
           actual_funds = set(
-              df["fund_ticker"].dropna().astype(str).unique()
+              df["fund_ticker"]
+              .dropna()
+              .astype(str)
+              .unique()
           )
 
           if actual_funds != expected_funds:
               raise SystemExit(
-                  f"ETF mismatch. Expected {expected_funds}, got {actual_funds}"
+                  f"ETF mismatch. Expected {expected_funds}, "
+                  f"got {actual_funds}"
               )
 
           source_dates = {}
@@ -129,8 +139,18 @@ jobs:
 
               source_dates[str(ticker)] = dates[0]
 
-          # XLF, XLI and XLC are used as the daily freshness anchor.
-          anchor_funds = ("XLF", "XLI", "XLC")
+          #
+          # STATE STREET DAILY ANCHOR
+          #
+          # XLF, XLI and XLC are all daily State Street files.
+          # They should normally report the same source date.
+          #
+
+          anchor_funds = (
+              "XLF",
+              "XLI",
+              "XLC",
+          )
 
           anchor_dates = {
               ticker: source_dates[ticker]
@@ -142,14 +162,29 @@ jobs:
                   "State Street anchor funds disagree: "
                   + ", ".join(
                       f"{ticker}={value.isoformat()}"
-                      for ticker, value in anchor_dates.items()
+                      for ticker, value
+                      in anchor_dates.items()
                   )
               )
 
-          anchor_date = next(iter(anchor_dates.values()))
-          today_utc = pd.Timestamp.now(tz="UTC").date()
+          anchor_date = next(
+              iter(anchor_dates.values())
+          )
+
+          today_utc = (
+              pd.Timestamp.now(tz="UTC").date()
+          )
 
           def weekday_steps(start, end):
+              """
+              Count weekdays AFTER start and up to end.
+
+              Example:
+                  Friday -> Monday = 1
+                  Thursday -> Monday = 2
+
+              This avoids treating a weekend as three stale days.
+              """
               count = 0
               cursor = start
 
@@ -164,18 +199,80 @@ jobs:
 
               return count
 
-          # Prevent the anchor itself becoming badly stale.
-          # Allows weekends and roughly one market holiday.
-          if weekday_steps(anchor_date, today_utc) > 2:
+          #
+          # Make sure even the State Street anchor has not stopped updating.
+          #
+          # Allow up to two weekdays because US holidays/publication timing
+          # can legitimately create a short delay.
+          #
+
+          anchor_age = weekday_steps(
+              anchor_date,
+              today_utc,
+          )
+
+          if anchor_age > 2:
               raise SystemExit(
                   "State Street anchor is stale: "
-                  f"{anchor_date.isoformat()} vs {today_utc.isoformat()}"
+                  f"{anchor_date.isoformat()} "
+                  f"vs {today_utc.isoformat()} "
+                  f"({anchor_age} business days)"
               )
 
-          # Maximum allowed lag compared with XLF/XLI/XLC.
-          max_lag_days = {
-              "VGT": 1,
-              "ACWI": 2,
+          #
+          # VGT — MONTHLY PROVIDER SNAPSHOT
+          #
+          # Vanguard's full VGT holdings are not a daily file.
+          # Therefore VGT must NOT be compared to XLF/XLI/XLC
+          # using a 1-day freshness requirement.
+          #
+          # We accept the genuine Vanguard month-end snapshot,
+          # but reject an implausibly old one.
+          #
+
+          vgt_date = source_dates["VGT"]
+
+          if vgt_date > anchor_date:
+              raise SystemExit(
+                  f"VGT source date {vgt_date} "
+                  f"is ahead of anchor {anchor_date}"
+              )
+
+          # Vanguard full-holdings snapshots should be month-end.
+          next_day = (
+              pd.Timestamp(vgt_date)
+              + pd.Timedelta(days=1)
+          ).date()
+
+          if next_day.month == vgt_date.month:
+              raise SystemExit(
+                  f"VGT source_date {vgt_date} "
+                  "is not month-end"
+              )
+
+          vgt_age_calendar_days = (
+              anchor_date
+              - vgt_date
+          ).days
+
+          if vgt_age_calendar_days > 45:
+              raise SystemExit(
+                  "VGT monthly holdings are too old: "
+                  f"{vgt_date} vs {anchor_date} "
+                  f"({vgt_age_calendar_days} calendar days)"
+              )
+
+          #
+          # DAILY / NEAR-DAILY PROVIDERS
+          #
+          # These limits are BUSINESS DAYS behind the State Street anchor.
+          #
+          # Friday 28 Aug -> Monday 31 Aug = 1 business day,
+          # NOT 3 calendar days.
+          #
+
+          max_lag_business_days = {
+              "ACWI": 1,
               "XLF": 0,
               "XLI": 0,
               "XLC": 0,
@@ -187,23 +284,31 @@ jobs:
 
           stale = []
 
-          for ticker, allowed_lag in max_lag_days.items():
-              lag = (
-                  anchor_date
-                  - source_dates[ticker]
-              ).days
+          for (
+              ticker,
+              allowed_lag,
+          ) in max_lag_business_days.items():
 
-              if lag < 0:
+              source_date = source_dates[ticker]
+
+              if source_date > anchor_date:
                   stale.append(
-                      f"{ticker}={source_dates[ticker]} is ahead of "
-                      f"anchor={anchor_date}"
+                      f"{ticker}={source_date} "
+                      f"is ahead of anchor={anchor_date}"
                   )
+                  continue
 
-              elif lag > allowed_lag:
+              lag = weekday_steps(
+                  source_date,
+                  anchor_date,
+              )
+
+              if lag > allowed_lag:
                   stale.append(
-                      f"{ticker}={source_dates[ticker]} lags "
-                      f"anchor={anchor_date} by {lag}d "
-                      f"(limit {allowed_lag}d)"
+                      f"{ticker}={source_date} "
+                      f"lags anchor={anchor_date} "
+                      f"by {lag} business day(s) "
+                      f"(limit {allowed_lag})"
                   )
 
           if stale:
@@ -212,18 +317,70 @@ jobs:
                   + "\n  - ".join(stale)
               )
 
+          #
+          # BASIC DATA QUALITY CHECKS
+          #
+
+          for ticker, group in df.groupby(
+              "fund_ticker"
+          ):
+              weights = pd.to_numeric(
+                  group["weight"],
+                  errors="coerce",
+              )
+
+              if weights.isna().any():
+                  missing = int(
+                      weights.isna().sum()
+                  )
+
+                  raise SystemExit(
+                      f"{ticker}: {missing} "
+                      "holdings have blank/non-numeric weights"
+                  )
+
+              total_weight = float(
+                  weights.sum()
+              )
+
+              if not (
+                  97.0
+                  <= total_weight
+                  <= 103.0
+              ):
+                  raise SystemExit(
+                      f"{ticker}: weight sum "
+                      f"{total_weight:.8f}% "
+                      "outside acceptable range"
+                  )
+
           print(
               f"Validated {len(df):,} rows "
               f"across {len(actual_funds)} ETFs"
           )
 
-          for ticker, group in df.groupby("fund_ticker"):
+          print(
+              f"Daily anchor: "
+              f"{anchor_date.isoformat()}"
+          )
+
+          print(
+              f"VGT monthly snapshot: "
+              f"{vgt_date.isoformat()}"
+          )
+
+          for ticker, group in df.groupby(
+              "fund_ticker"
+          ):
               print(
                   ticker,
                   len(group),
-                  f"weight={group['weight'].sum():.8f}%",
-                  f"source_date={group['source_date'].iloc[0]}",
+                  f"weight="
+                  f"{group['weight'].sum():.8f}%",
+                  f"source_date="
+                  f"{group['source_date'].iloc[0]}",
               )
+
           PY
 
       - name: Commit updated CSV
@@ -231,7 +388,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          cp data/ETF_Holdings_Latest.csv /tmp/ETF_Holdings_Latest.csv
+          cp \
+            data/ETF_Holdings_Latest.csv \
+            /tmp/ETF_Holdings_Latest.csv
 
           git fetch origin main
 
@@ -243,14 +402,26 @@ jobs:
 
           git reset --hard origin/main
 
-          # Ignore retrieved_at_utc when checking whether holdings actually
-          # changed. This stops the later retry making duplicate commits.
+          #
+          # Ignore retrieved_at_utc when deciding whether there was
+          # a substantive holdings change.
+          #
+          # This avoids duplicate commits when the same provider
+          # snapshot is fetched twice on the same day.
+          #
+
           if [ -f data/ETF_Holdings_Latest.csv ]; then
+
             SAME_HOLDINGS="$(python - <<'PY'
           import pandas as pd
 
-          old = pd.read_csv("data/ETF_Holdings_Latest.csv")
-          new = pd.read_csv("/tmp/ETF_Holdings_Latest.csv")
+          old = pd.read_csv(
+              "data/ETF_Holdings_Latest.csv"
+          )
+
+          new = pd.read_csv(
+              "/tmp/ETF_Holdings_Latest.csv"
+          )
 
           compare_columns = [
               column
@@ -259,12 +430,23 @@ jobs:
           ]
 
           same = (
-              list(old.columns) == list(new.columns)
+              list(old.columns)
+              == list(new.columns)
               and len(old) == len(new)
-              and old[compare_columns].equals(new[compare_columns])
+              and old[
+                  compare_columns
+              ].equals(
+                  new[
+                      compare_columns
+                  ]
+              )
           )
 
-          print("yes" if same else "no")
+          print(
+              "yes"
+              if same
+              else "no"
+          )
           PY
           )"
 
@@ -272,19 +454,27 @@ jobs:
               echo "No substantive holdings changes detected."
               exit 0
             fi
+
           fi
 
           mkdir -p data
-          cp /tmp/ETF_Holdings_Latest.csv data/ETF_Holdings_Latest.csv
 
-          git add data/ETF_Holdings_Latest.csv
+          cp \
+            /tmp/ETF_Holdings_Latest.csv \
+            data/ETF_Holdings_Latest.csv
+
+          git add \
+            data/ETF_Holdings_Latest.csv
 
           if git diff --cached --quiet; then
             echo "No holdings changes detected."
             exit 0
           fi
 
-          git commit -m "Update ETF holdings $(date -u +'%Y-%m-%d %H:%M UTC')"
-          git push origin HEAD:main
+          git commit \
+            -m "Update ETF holdings $(date -u +'%Y-%m-%d %H:%M UTC')"
+
+          git push \
+            origin HEAD:main
 
           echo "Holdings CSV successfully published."
