@@ -108,8 +108,7 @@ jobs:
 
           if actual_funds != expected_funds:
               raise SystemExit(
-                  f"ETF mismatch. Expected {expected_funds}, "
-                  f"got {actual_funds}"
+                  f"ETF mismatch. Expected {expected_funds}, got {actual_funds}"
               )
 
           source_dates = {}
@@ -121,16 +120,9 @@ jobs:
               ).dropna()
 
               if parsed.empty:
-                  raise SystemExit(
-                      f"{ticker}: no valid source_date"
-                  )
+                  raise SystemExit(f"{ticker}: no valid source_date")
 
-              dates = sorted(
-                  {
-                      value.date()
-                      for value in parsed
-                  }
-              )
+              dates = sorted({value.date() for value in parsed})
 
               if len(dates) != 1:
                   raise SystemExit(
@@ -139,19 +131,7 @@ jobs:
 
               source_dates[str(ticker)] = dates[0]
 
-          #
-          # STATE STREET DAILY ANCHOR
-          #
-          # XLF, XLI and XLC are all daily State Street files.
-          # They should normally report the same source date.
-          #
-
-          anchor_funds = (
-              "XLF",
-              "XLI",
-              "XLC",
-          )
-
+          anchor_funds = ("XLF", "XLI", "XLC")
           anchor_dates = {
               ticker: source_dates[ticker]
               for ticker in anchor_funds
@@ -162,116 +142,38 @@ jobs:
                   "State Street anchor funds disagree: "
                   + ", ".join(
                       f"{ticker}={value.isoformat()}"
-                      for ticker, value
-                      in anchor_dates.items()
+                      for ticker, value in anchor_dates.items()
                   )
               )
 
-          anchor_date = next(
-              iter(anchor_dates.values())
-          )
-
-          today_utc = (
-              pd.Timestamp.now(tz="UTC").date()
-          )
+          anchor_date = next(iter(anchor_dates.values()))
+          today_utc = pd.Timestamp.now(tz="UTC").date()
 
           def weekday_steps(start, end):
-              """
-              Count weekdays AFTER start and up to end.
-
-              Example:
-                  Friday -> Monday = 1
-                  Thursday -> Monday = 2
-
-              This avoids treating a weekend as three stale days.
-              """
               count = 0
               cursor = start
-
               while cursor < end:
                   cursor = (
                       pd.Timestamp(cursor)
                       + pd.Timedelta(days=1)
                   ).date()
-
                   if cursor.weekday() < 5:
                       count += 1
-
               return count
 
-          #
-          # Make sure even the State Street anchor has not stopped updating.
-          #
-          # Allow up to two weekdays because US holidays/publication timing
-          # can legitimately create a short delay.
-          #
-
-          anchor_age = weekday_steps(
-              anchor_date,
-              today_utc,
-          )
-
+          anchor_age = weekday_steps(anchor_date, today_utc)
           if anchor_age > 2:
               raise SystemExit(
                   "State Street anchor is stale: "
-                  f"{anchor_date.isoformat()} "
-                  f"vs {today_utc.isoformat()} "
+                  f"{anchor_date.isoformat()} vs {today_utc.isoformat()} "
                   f"({anchor_age} business days)"
               )
 
-          #
-          # VGT — MONTHLY PROVIDER SNAPSHOT
-          #
-          # Vanguard's full VGT holdings are not a daily file.
-          # Therefore VGT must NOT be compared to XLF/XLI/XLC
-          # using a 1-day freshness requirement.
-          #
-          # We accept the genuine Vanguard month-end snapshot,
-          # but reject an implausibly old one.
-          #
-
-          vgt_date = source_dates["VGT"]
-
-          if vgt_date > anchor_date:
-              raise SystemExit(
-                  f"VGT source date {vgt_date} "
-                  f"is ahead of anchor {anchor_date}"
-              )
-
-          # Vanguard full-holdings snapshots should be month-end.
-          next_day = (
-              pd.Timestamp(vgt_date)
-              + pd.Timedelta(days=1)
-          ).date()
-
-          if next_day.month == vgt_date.month:
-              raise SystemExit(
-                  f"VGT source_date {vgt_date} "
-                  "is not month-end"
-              )
-
-          vgt_age_calendar_days = (
-              anchor_date
-              - vgt_date
-          ).days
-
-          if vgt_age_calendar_days > 45:
-              raise SystemExit(
-                  "VGT monthly holdings are too old: "
-                  f"{vgt_date} vs {anchor_date} "
-                  f"({vgt_age_calendar_days} calendar days)"
-              )
-
-          #
-          # DAILY / NEAR-DAILY PROVIDERS
-          #
-          # These limits are BUSINESS DAYS behind the State Street anchor.
-          #
-          # Friday 28 Aug -> Monday 31 Aug = 1 business day,
-          # NOT 3 calendar days.
-          #
-
+          # VGT is now the DAILY Vanguard Portfolio Composition File (PCF),
+          # so it belongs in the same business-day freshness gate as the
+          # other daily / near-daily providers.
           max_lag_business_days = {
+              "VGT": 1,
               "ACWI": 1,
               "XLF": 0,
               "XLI": 0,
@@ -284,31 +186,25 @@ jobs:
 
           stale = []
 
-          for (
-              ticker,
-              allowed_lag,
-          ) in max_lag_business_days.items():
-
+          for ticker, allowed_lag in max_lag_business_days.items():
               source_date = source_dates[ticker]
 
+              # A same-day VGT PCF may legitimately be one business day ahead
+              # of a lagging daily anchor during provider publication windows.
               if source_date > anchor_date:
+                  lead = weekday_steps(anchor_date, source_date)
+                  if ticker == "VGT" and lead <= 1:
+                      continue
                   stale.append(
-                      f"{ticker}={source_date} "
-                      f"is ahead of anchor={anchor_date}"
+                      f"{ticker}={source_date} is ahead of anchor={anchor_date}"
                   )
                   continue
 
-              lag = weekday_steps(
-                  source_date,
-                  anchor_date,
-              )
-
+              lag = weekday_steps(source_date, anchor_date)
               if lag > allowed_lag:
                   stale.append(
-                      f"{ticker}={source_date} "
-                      f"lags anchor={anchor_date} "
-                      f"by {lag} business day(s) "
-                      f"(limit {allowed_lag})"
+                      f"{ticker}={source_date} lags anchor={anchor_date} "
+                      f"by {lag} business day(s) (limit {allowed_lag})"
                   )
 
           if stale:
@@ -317,70 +213,37 @@ jobs:
                   + "\n  - ".join(stale)
               )
 
-          #
-          # BASIC DATA QUALITY CHECKS
-          #
-
-          for ticker, group in df.groupby(
-              "fund_ticker"
-          ):
-              weights = pd.to_numeric(
-                  group["weight"],
-                  errors="coerce",
-              )
-
+          for ticker, group in df.groupby("fund_ticker"):
+              weights = pd.to_numeric(group["weight"], errors="coerce")
               if weights.isna().any():
-                  missing = int(
-                      weights.isna().sum()
-                  )
-
                   raise SystemExit(
-                      f"{ticker}: {missing} "
+                      f"{ticker}: {int(weights.isna().sum())} "
                       "holdings have blank/non-numeric weights"
                   )
 
-              total_weight = float(
-                  weights.sum()
-              )
-
-              if not (
-                  97.0
-                  <= total_weight
-                  <= 103.0
-              ):
+              total_weight = float(weights.sum())
+              if not (97.0 <= total_weight <= 103.0):
                   raise SystemExit(
-                      f"{ticker}: weight sum "
-                      f"{total_weight:.8f}% "
+                      f"{ticker}: weight sum {total_weight:.8f}% "
                       "outside acceptable range"
                   )
 
           print(
-              f"Validated {len(df):,} rows "
-              f"across {len(actual_funds)} ETFs"
+              f"Validated {len(df):,} rows across {len(actual_funds)} ETFs"
           )
-
+          print(f"Daily anchor: {anchor_date.isoformat()}")
           print(
-              f"Daily anchor: "
-              f"{anchor_date.isoformat()}"
+              "VGT daily PCF: "
+              f"{source_dates['VGT'].isoformat()}"
           )
 
-          print(
-              f"VGT monthly snapshot: "
-              f"{vgt_date.isoformat()}"
-          )
-
-          for ticker, group in df.groupby(
-              "fund_ticker"
-          ):
+          for ticker, group in df.groupby("fund_ticker"):
               print(
                   ticker,
                   len(group),
-                  f"weight="
-                  f"{group['weight'].sum():.8f}%",
-                  f"source_date="
-                  f"{group['source_date'].iloc[0]}",
+                  f"weight={group['weight'].sum():.8f}%",
+                  f"source_date={group['source_date'].iloc[0]}",
               )
-
           PY
 
       - name: Commit updated CSV
@@ -388,9 +251,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          cp \
-            data/ETF_Holdings_Latest.csv \
-            /tmp/ETF_Holdings_Latest.csv
+          cp data/ETF_Holdings_Latest.csv /tmp/ETF_Holdings_Latest.csv
 
           git fetch origin main
 
@@ -402,26 +263,12 @@ jobs:
 
           git reset --hard origin/main
 
-          #
-          # Ignore retrieved_at_utc when deciding whether there was
-          # a substantive holdings change.
-          #
-          # This avoids duplicate commits when the same provider
-          # snapshot is fetched twice on the same day.
-          #
-
           if [ -f data/ETF_Holdings_Latest.csv ]; then
-
             SAME_HOLDINGS="$(python - <<'PY'
           import pandas as pd
 
-          old = pd.read_csv(
-              "data/ETF_Holdings_Latest.csv"
-          )
-
-          new = pd.read_csv(
-              "/tmp/ETF_Holdings_Latest.csv"
-          )
+          old = pd.read_csv("data/ETF_Holdings_Latest.csv")
+          new = pd.read_csv("/tmp/ETF_Holdings_Latest.csv")
 
           compare_columns = [
               column
@@ -430,23 +277,12 @@ jobs:
           ]
 
           same = (
-              list(old.columns)
-              == list(new.columns)
+              list(old.columns) == list(new.columns)
               and len(old) == len(new)
-              and old[
-                  compare_columns
-              ].equals(
-                  new[
-                      compare_columns
-                  ]
-              )
+              and old[compare_columns].equals(new[compare_columns])
           )
 
-          print(
-              "yes"
-              if same
-              else "no"
-          )
+          print("yes" if same else "no")
           PY
           )"
 
@@ -454,27 +290,19 @@ jobs:
               echo "No substantive holdings changes detected."
               exit 0
             fi
-
           fi
 
           mkdir -p data
+          cp /tmp/ETF_Holdings_Latest.csv data/ETF_Holdings_Latest.csv
 
-          cp \
-            /tmp/ETF_Holdings_Latest.csv \
-            data/ETF_Holdings_Latest.csv
-
-          git add \
-            data/ETF_Holdings_Latest.csv
+          git add data/ETF_Holdings_Latest.csv
 
           if git diff --cached --quiet; then
             echo "No holdings changes detected."
             exit 0
           fi
 
-          git commit \
-            -m "Update ETF holdings $(date -u +'%Y-%m-%d %H:%M UTC')"
-
-          git push \
-            origin HEAD:main
+          git commit -m "Update ETF holdings $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push origin HEAD:main
 
           echo "Holdings CSV successfully published."
