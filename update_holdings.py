@@ -11,14 +11,17 @@ Dependencies:
     pip install pandas requests yfinance openpyxl lxml html5lib curl_cffi selenium
 
 Important VGT behaviour:
-- VGT uses Vanguard's provider-reported holdings weights.
-- VGT weights are NEVER synthetically drifted with Yahoo prices.
-- Vanguard source_date must be a genuine month-end holdings date.
-- If the normal Vanguard API is blocked, the script retries through curl_cffi,
-  then through Chrome/Selenium in a same-origin browser session.
-- If Vanguard is unavailable, only a validated prior OFFICIAL month-end VGT
-  snapshot may be retained unchanged. A non-month-end prior VGT snapshot is
-  rejected because it may be a synthetic/stale snapshot from an older script.
+- VGT composition comes from Vanguard's DAILY Portfolio Composition File (PCF),
+  not Vanguard's lagged month-end full-holdings table.
+- The PCF gives the security quantities required for one creation basket.
+- VGT weights are calculated from DAILY PCF quantities multiplied by the latest
+  completed US-market close strictly before the PCF effective date.
+- Yahoo is used only to value the CURRENT DAILY PCF basket; stale monthly Vanguard
+  share counts are never drifted forward.
+- shares_held and market_value_usd for VGT therefore refer to the PCF creation basket,
+  not the ETF's aggregate fund-level shares/market values.
+- If today's PCF cannot be retrieved, only a recent previous DAILY PCF snapshot may
+  be retained. Old month-end VGT snapshots are rejected.
 
 Output schema is kept stable for Power Query.
 """
@@ -47,7 +50,7 @@ from lxml import html as lxml_html
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-SCRIPT_REVISION = "2026-08-31-vgt-api-v3"
+SCRIPT_REVISION = "2026-08-31-vgt-daily-pcf-v5"
 
 DEFAULT_OUT_DIR = Path("data")
 DEFAULT_COMBINED_NAME = "ETF_Holdings_Latest.csv"
@@ -158,6 +161,15 @@ VANGUARD_ADVISOR_URL = (
     "https://advisors.vanguard.com/investments/products/"
     "{ticker}/vanguard-information-technology-etf"
 )
+
+# Vanguard ETF daily Portfolio Composition File (PCF).  VGT's legacy Vanguard
+# fund id is 0958.  Vanguard describes this PCF as the basket of securities an
+# authorized participant deposits/receives for a creation/redemption unit on the
+# date shown.  This endpoint has historically been the direct PCF view.
+VANGUARD_PCF_URL = "https://personal.vanguard.com/us/FundsVIPERPCF"
+VANGUARD_PCF_FUND_IDS = {"VGT": "0958"}
+VANGUARD_PCF_MAX_AGE_BUSINESS_DAYS = 2
+VANGUARD_PCF_MAX_PAGES = 30
 
 SCHWAB_SOXQ_URL = (
     "https://www.schwab.wallst.com/schwab/Prospect/research/etfs/"
@@ -351,19 +363,32 @@ def is_month_end(date_text: str) -> bool:
     return (d + timedelta(days=1)).month != d.month
 
 
+def _weekday_steps(start: date, end: date) -> int:
+    count = 0
+    cursor = start
+    while cursor < end:
+        cursor += timedelta(days=1)
+        if cursor.weekday() < 5:
+            count += 1
+    return count
+
+
 def validate_vanguard_source_date(source_date: str) -> None:
-    """Vanguard's public full-holdings series is month-end. Reject fake dates."""
-    if not is_month_end(source_date):
+    """Validate a DAILY Vanguard PCF effective date."""
+    try:
+        parsed = datetime.fromisoformat(source_date).date()
+    except Exception as exc:
+        raise HoldingsError(f"VGT: invalid PCF source_date {source_date!r}") from exc
+
+    today = utc_now().date()
+    if parsed > today:
+        raise HoldingsError(f"VGT: future PCF source_date {source_date}")
+
+    age = _weekday_steps(parsed, today)
+    if age > VANGUARD_PCF_MAX_AGE_BUSINESS_DAYS:
         raise HoldingsError(
-            f"VGT: Vanguard source_date {source_date!r} is not month-end; "
-            "refusing to label it as an official holdings snapshot"
-        )
-    parsed = datetime.fromisoformat(source_date).date()
-    if parsed > utc_now().date():
-        raise HoldingsError(f"VGT: future Vanguard source_date {source_date}")
-    if (utc_now().date() - parsed).days > 70:
-        raise HoldingsError(
-            f"VGT: Vanguard holdings snapshot {source_date} is implausibly old"
+            f"VGT: daily Vanguard PCF {source_date} is {age} business days old; "
+            f"limit is {VANGUARD_PCF_MAX_AGE_BUSINESS_DAYS}"
         )
 
 
@@ -644,12 +669,194 @@ def _score_holdings_list(rows: list[dict[str, Any]]) -> int:
     return score
 
 
+
+def _weighted_median(values: list[float], weights: list[float]) -> float:
+    """Weighted median without numpy; used only as a denominator fallback."""
+    pairs = sorted(zip(values, weights), key=lambda item: item[0])
+    total_weight = sum(weight for _, weight in pairs)
+    if total_weight <= 0:
+        raise HoldingsError("VGT: invalid weights while estimating fund denominator")
+    running = 0.0
+    halfway = total_weight / 2.0
+    for value, weight in pairs:
+        running += weight
+        if running >= halfway:
+            return float(value)
+    return float(pairs[-1][0])
+
+
+def refine_vanguard_weights_from_market_values(
+    frame: pd.DataFrame,
+    *,
+    etf: str = "VGT",
+) -> tuple[pd.DataFrame, float]:
+    """
+    Recover high-precision Vanguard weights from Vanguard's OWN market values.
+
+    Vanguard displays percentWeight to only 2 decimal places.  We do not want to
+    publish those rounded values, but we also must not invent weights using live
+    Yahoo prices.
+
+    For a holding with displayed weight w (e.g. 17.15%) and official market
+    value M, the true fund denominator T must satisfy:
+
+        round(100 * M / T, 2) == w
+
+    Therefore T lies inside an interval implied by the 2dp rounding.  We
+    intersect the intervals from the material holdings.  If the intersection is
+    non-empty, its midpoint is an estimate of the same Vanguard fund denominator
+    that generated the displayed percentages.  This automatically respects cash
+    / short-term reserves that may not be in the stock table.
+
+    If tiny valuation/display inconsistencies make the interval intersection
+    empty, fall back to a weighted median of M / w using the largest holdings.
+    The rounded provider weights remain a validation check, never the final
+    precision source.
+    """
+    out = frame.copy()
+
+    provider_weight = pd.to_numeric(
+        out["weight"],
+        errors="coerce",
+    )
+    market_value = pd.to_numeric(
+        out["market_value"],
+        errors="coerce",
+    )
+
+    usable = (
+        provider_weight.notna()
+        & market_value.notna()
+        & (provider_weight > 0.05)
+        & (market_value > 0)
+    )
+
+    if int(usable.sum()) < 10:
+        raise HoldingsError(
+            f"{etf}: only {int(usable.sum())} holdings have both "
+            "material provider weight and Vanguard market value"
+        )
+
+    # Largest holdings provide the tightest denominator bounds because a 0.005
+    # percentage-point rounding band is proportionally smallest for them.
+    candidates = (
+        pd.DataFrame(
+            {
+                "weight": provider_weight.loc[usable],
+                "market_value": market_value.loc[usable],
+            }
+        )
+        .sort_values("weight", ascending=False)
+        .head(40)
+    )
+
+    lower_bounds: list[float] = []
+    upper_bounds: list[float] = []
+    implied_totals: list[float] = []
+    median_weights: list[float] = []
+
+    for _, row in candidates.iterrows():
+        w = float(row["weight"])
+        mv = float(row["market_value"])
+
+        # Vanguard displays two decimal places.  Allow a very small epsilon at
+        # the 0.005 boundaries for representation/rounding conventions.
+        lower_pct = max(w - 0.00505, 1e-9)
+        upper_pct = w + 0.00505
+
+        lower_total = mv * 100.0 / upper_pct
+        upper_total = mv * 100.0 / lower_pct
+
+        lower_bounds.append(lower_total)
+        upper_bounds.append(upper_total)
+
+        implied_totals.append(mv * 100.0 / w)
+        # Larger weights have much less relative rounding error.
+        median_weights.append(w * w)
+
+    intersection_low = max(lower_bounds)
+    intersection_high = min(upper_bounds)
+
+    if (
+        math.isfinite(intersection_low)
+        and math.isfinite(intersection_high)
+        and intersection_low <= intersection_high
+    ):
+        denominator = (
+            intersection_low
+            + intersection_high
+        ) / 2.0
+        denominator_method = "rounding_interval_intersection"
+    else:
+        denominator = _weighted_median(
+            implied_totals,
+            median_weights,
+        )
+        denominator_method = "weighted_median_fallback"
+
+    if not math.isfinite(denominator) or denominator <= 0:
+        raise HoldingsError(
+            f"{etf}: invalid Vanguard market-value denominator {denominator}"
+        )
+
+    precise_weight = (
+        market_value
+        / denominator
+        * 100.0
+    )
+
+    # Validate the reconstructed weights against Vanguard's displayed 2dp
+    # values on material holdings.  Each should be within the original rounding
+    # band; permit 0.006pp to handle display/valuation micro-differences.
+    comparison = (
+        usable
+        & precise_weight.notna()
+    )
+    gaps = (
+        precise_weight.loc[comparison]
+        - provider_weight.loc[comparison]
+    ).abs()
+
+    bad = gaps > 0.0061
+    if bad.any():
+        worst_index = gaps.idxmax()
+        raise HoldingsError(
+            f"{etf}: reconstructed Vanguard weight disagrees with provider "
+            f"display for row {worst_index}: "
+            f"precise={precise_weight.loc[worst_index]:.8f}% vs "
+            f"displayed={provider_weight.loc[worst_index]:.2f}%"
+        )
+
+    # Replace ONLY rows for which Vanguard supplied an official market value.
+    # No Yahoo prices enter this calculation.
+    valid_market_value = (
+        market_value.notna()
+        & (market_value > 0)
+    )
+    out.loc[
+        valid_market_value,
+        "weight",
+    ] = precise_weight.loc[
+        valid_market_value
+    ]
+
+    print(
+        f"[{etf}] Vanguard precise weights: "
+        f"denominator=${denominator:,.2f} "
+        f"({denominator_method}); "
+        f"{int(valid_market_value.sum())} rows recomputed from official market values",
+        file=sys.stderr,
+    )
+
+    return out, denominator
+
+
 def parse_vanguard_payload(
     payload: Any,
     etf: str,
     source_date_hint: str | None = None,
 ) -> FetchResult:
-    """Parse Vanguard JSON while preserving Vanguard's own reported weights."""
+    """Parse Vanguard JSON and reconstruct precise weights from Vanguard market values."""
     candidates = list(_walk_dict_lists(payload))
     if not candidates:
         raise HoldingsError(f"{etf}: no holdings list in Vanguard JSON")
@@ -693,7 +900,13 @@ def parse_vanguard_payload(
             "sedol": clean_text(entity.get("sedol") or ""),
         })
 
-    frame = drop_nonsecurity_rows(pd.DataFrame(rows, columns=STD_COLS))
+    frame = pd.DataFrame(rows, columns=STD_COLS)
+    frame, _ = refine_vanguard_weights_from_market_values(
+        frame,
+        etf=etf,
+    )
+    frame = drop_nonsecurity_rows(frame)
+
     source_date = find_vanguard_holdings_date(payload) or source_date_hint
     if not source_date:
         raise HoldingsError(
@@ -705,7 +918,7 @@ def parse_vanguard_payload(
     return FetchResult(
         frame=frame,
         source_date=source_date,
-        precision_method="vanguard_provider_weight",
+        precision_method="vanguard_market_value_implied_nav",
     )
 
 
@@ -893,6 +1106,10 @@ def _read_vanguard_export(path: Path, source_date: str, etf: str) -> FetchResult
         })
 
     result = pd.DataFrame(rows, columns=STD_COLS)
+    result, _ = refine_vanguard_weights_from_market_values(
+        result,
+        etf=etf,
+    )
     result = drop_nonsecurity_rows(result)
 
     # VGT should have ~319 stocks. This deliberately catches a click that only
@@ -909,13 +1126,13 @@ def _read_vanguard_export(path: Path, source_date: str, etf: str) -> FetchResult
     total = float(weights.sum(skipna=True))
     if not (MIN_TOTAL_WEIGHT <= total <= MAX_TOTAL_WEIGHT):
         raise HoldingsError(
-            f"VGT: Vanguard provider weights sum to {total:.6f}%"
+            f"VGT: reconstructed Vanguard weights sum to {total:.6f}%"
         )
 
     return FetchResult(
         frame=result.reset_index(drop=True),
         source_date=source_date,
-        precision_method="vanguard_advisor_export_provider_weight",
+        precision_method="vanguard_advisor_export_market_value_implied_nav",
     )
 
 
@@ -1288,6 +1505,10 @@ def _fetch_vanguard_advisor_dom(etf: str, timeout: int) -> FetchResult:
                 break
 
         result = pd.DataFrame(list(collected.values()), columns=STD_COLS)
+        result, _ = refine_vanguard_weights_from_market_values(
+            result,
+            etf=etf,
+        )
         result = drop_nonsecurity_rows(result)
 
         if len(result) < MIN_HOLDINGS[etf]:
@@ -1299,19 +1520,19 @@ def _fetch_vanguard_advisor_dom(etf: str, timeout: int) -> FetchResult:
         weights = pd.to_numeric(result["weight"], errors="coerce")
         total = float(weights.sum(skipna=True))
         if int(weights.notna().sum()) < math.floor(len(result) * 0.97):
-            raise HoldingsError("VGT: too many Advisor DOM rows have blank provider weights")
+            raise HoldingsError("VGT: too many Advisor DOM rows have blank reconstructed weights")
         if not (MIN_TOTAL_WEIGHT <= total <= MAX_TOTAL_WEIGHT):
-            raise HoldingsError(f"VGT: Advisor DOM provider weights sum to {total:.6f}%")
+            raise HoldingsError(f"VGT: Advisor DOM reconstructed weights sum to {total:.6f}%")
 
         print(
             f"[VGT] Vanguard Advisor DOM: {len(result)} securities, "
-            f"source_date={source_date}, provider_weight_sum={total:.8f}%",
+            f"source_date={source_date}, reconstructed_weight_sum={total:.8f}%",
             file=sys.stderr,
         )
         return FetchResult(
             frame=result.reset_index(drop=True),
             source_date=source_date,
-            precision_method="vanguard_advisor_dom_provider_weight",
+            precision_method="vanguard_advisor_dom_market_value_implied_nav",
         )
 
     finally:
@@ -1362,6 +1583,447 @@ def _vanguard_json_response(
             f"VGT: Vanguard {transport} JSON decode failed: {exc}; "
             f"body={preview!r}"
         ) from exc
+
+
+
+def _vanguard_pcf_date(page_text: str) -> str | None:
+    """Extract the effective date printed on Vanguard's PCF page."""
+    patterns = (
+        r"(?is)portfolio\s+composition\s+file\s*\(\s*as\s+of\s*"
+        r"([^)]+)\)",
+        r"(?is)portfolio\s+composition\s+file.{0,250}?as\s+of\s*[:\-]?\s*"
+        r"(\d{1,2}/\d{1,2}/20\d{2}|20\d{2}-\d{1,2}-\d{1,2}|"
+        r"[A-Za-z]+\s+\d{1,2},?\s+20\d{2})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, page_text)
+        if match:
+            parsed = normalize_date_value(clean_text(match.group(1)))
+            if parsed:
+                return parsed
+    return None
+
+
+def _vanguard_pcf_page_range(page_text: str) -> tuple[int, int, int] | None:
+    """Return the displayed first row, last row and total row count."""
+    matches = re.findall(
+        r"(?i)([\d,]+)\s*[\-–—]\s*([\d,]+)\s+of\s+([\d,]+)",
+        page_text,
+    )
+    parsed: list[tuple[int, int, int]] = []
+    for first, last, total in matches:
+        try:
+            parsed.append(
+                (
+                    int(first.replace(",", "")),
+                    int(last.replace(",", "")),
+                    int(total.replace(",", "")),
+                )
+            )
+        except Exception:
+            pass
+    return max(parsed, key=lambda x: x[2]) if parsed else None
+
+
+def _parse_vanguard_pcf_page(page_html: str) -> tuple[list[dict[str, Any]], str | None, tuple[int, int, int] | None]:
+    """Parse one server-rendered Vanguard PCF page."""
+    try:
+        tables = pd.read_html(io.StringIO(page_html))
+    except Exception as exc:
+        raise HoldingsError(f"VGT: PCF page contained no readable HTML tables: {exc}") from exc
+
+    chosen: pd.DataFrame | None = None
+    for table in tables:
+        cols = [clean_text(c).lower() for c in table.columns]
+        has_ticker = any("ticker" in c or "symbol" in c for c in cols)
+        has_shares = any("share" in c or "quantity" in c for c in cols)
+        has_desc = any("description" in c or "holding" in c or "security" in c for c in cols)
+        if has_ticker and has_shares and has_desc:
+            chosen = table.copy()
+            chosen.columns = [clean_text(c) for c in chosen.columns]
+            break
+
+    if chosen is None:
+        raise HoldingsError("VGT: Vanguard PCF page did not contain Ticker/Description/Shares table")
+
+    ticker_col = pick_col(chosen, ["ticker", "symbol"])
+    name_col = pick_col(chosen, ["description", "holding", "security", "name"])
+    shares_col = pick_col(chosen, ["shares", "quantity"])
+    cusip_col = pick_col(chosen, ["cusip"])
+    sedol_col = pick_col(chosen, ["sedol"])
+
+    rows: list[dict[str, Any]] = []
+    for _, row in chosen.iterrows():
+        ticker = clean_text(row.get(ticker_col, "")) if ticker_col else ""
+        name = clean_text(row.get(name_col, "")) if name_col else ""
+        shares = to_float(row.get(shares_col)) if shares_col else None
+        if not ticker or shares is None or shares <= 0:
+            continue
+        rows.append(
+            {
+                "raw_ticker": ticker,
+                "raw_name": name or ticker,
+                "weight": None,
+                "shares": shares,
+                "market_value": None,
+                "isin": "",
+                "sedol": clean_text(row.get(sedol_col, "")) if sedol_col else "",
+                "cusip": clean_text(row.get(cusip_col, "")) if cusip_col else "",
+            }
+        )
+
+    page_text = clean_text(lxml_html.fromstring(page_html).text_content())
+    return rows, _vanguard_pcf_date(page_text), _vanguard_pcf_page_range(page_text)
+
+
+def _fetch_vanguard_pcf_pages(
+    get_html: Callable[[int], str],
+    *,
+    etf: str,
+) -> tuple[pd.DataFrame, str]:
+    """Follow Vanguard's start-offset pagination until the complete daily PCF is collected."""
+    collected: dict[tuple[str, str], dict[str, Any]] = {}
+    source_date: str | None = None
+    start = 0
+    seen_starts: set[int] = set()
+    expected_total: int | None = None
+
+    for _ in range(VANGUARD_PCF_MAX_PAGES):
+        if start in seen_starts:
+            break
+        seen_starts.add(start)
+
+        page_html = get_html(start)
+        rows, page_date, page_range = _parse_vanguard_pcf_page(page_html)
+        if page_date:
+            if source_date and source_date != page_date:
+                raise HoldingsError(
+                    f"VGT: PCF pagination returned mixed dates {source_date} and {page_date}"
+                )
+            source_date = page_date
+
+        if page_range:
+            _first, last, total = page_range
+            expected_total = max(expected_total or 0, total)
+        else:
+            last = 0
+            total = 0
+
+        for row in rows:
+            key = (canonical_ticker(row["raw_ticker"]), normalized_name(row["raw_name"]))
+            collected[key] = row
+
+        if expected_total is not None and len(collected) >= expected_total:
+            break
+        if not rows:
+            break
+
+        # Vanguard's legacy PCF uses a zero-based `start` offset while displaying
+        # human ranges such as 1-50. Therefore the next start is the displayed
+        # last row number (50 -> next offset 50).
+        if page_range and last > start:
+            start = last
+        else:
+            start += len(rows)
+
+    if not source_date:
+        raise HoldingsError("VGT: PCF rows loaded but Vanguard PCF effective date was not found")
+    validate_vanguard_source_date(source_date)
+
+    frame = pd.DataFrame(
+        [
+            {
+                "raw_ticker": row["raw_ticker"],
+                "raw_name": row["raw_name"],
+                "weight": None,
+                "shares": row["shares"],
+                "market_value": None,
+                "isin": row.get("isin", ""),
+                "sedol": row.get("sedol", ""),
+            }
+            for row in collected.values()
+        ],
+        columns=STD_COLS,
+    )
+    frame = drop_nonsecurity_rows(frame)
+
+    if len(frame) < MIN_HOLDINGS[etf]:
+        raise HoldingsError(
+            f"VGT: daily PCF contained only {len(frame)} security rows; "
+            f"required at least {MIN_HOLDINGS[etf]}"
+        )
+
+    # A PCF total may include a cash line that drop_nonsecurity_rows removes, so
+    # permit a small difference but reject obviously truncated pagination.
+    if expected_total is not None and len(frame) < max(MIN_HOLDINGS[etf], expected_total - 15):
+        raise HoldingsError(
+            f"VGT: PCF advertises {expected_total} rows but only {len(frame)} securities parsed"
+        )
+
+    return frame.reset_index(drop=True), source_date
+
+
+def _yahoo_symbol_for_pcf(ticker: str) -> str:
+    symbol = canonical_ticker(ticker)
+    # Yahoo uses '-' for US share classes (e.g. BRK-B).
+    return symbol.replace(".", "-")
+
+
+def _vanguard_pcf_previous_closes(
+    tickers: Iterable[str],
+    source_date: str,
+) -> dict[str, float]:
+    """Latest completed raw close strictly BEFORE the PCF effective date."""
+    import yfinance as yf
+
+    pcf_day = datetime.fromisoformat(source_date).date()
+    start_day = pcf_day - timedelta(days=10)
+    symbols = list(dict.fromkeys(_yahoo_symbol_for_pcf(t) for t in tickers if clean_text(t)))
+    closes: dict[str, float] = {}
+
+    for offset in range(0, len(symbols), 75):
+        chunk = symbols[offset : offset + 75]
+        try:
+            data = yf.download(
+                tickers=chunk,
+                start=start_day.isoformat(),
+                end=(pcf_day + timedelta(days=1)).isoformat(),
+                auto_adjust=False,
+                actions=False,
+                progress=False,
+                threads=True,
+                group_by="column",
+            )
+        except Exception as exc:
+            print(f"[VGT] Yahoo batch price warning: {exc}", file=sys.stderr)
+            continue
+
+        if data is None or data.empty:
+            continue
+
+        # yfinance returns Price x Ticker columns for multi-symbol downloads and
+        # simple columns for a single symbol.
+        if isinstance(data.columns, pd.MultiIndex):
+            level0 = set(str(x) for x in data.columns.get_level_values(0))
+            level1 = set(str(x) for x in data.columns.get_level_values(1))
+            for symbol in chunk:
+                series = None
+                if "Close" in level0 and symbol in level1:
+                    series = data[("Close", symbol)]
+                elif symbol in level0 and "Close" in level1:
+                    series = data[(symbol, "Close")]
+                if series is None:
+                    continue
+                series = pd.to_numeric(series, errors="coerce").dropna()
+                series = series[[idx.date() < pcf_day for idx in series.index]]
+                if not series.empty and float(series.iloc[-1]) > 0:
+                    closes[symbol] = float(series.iloc[-1])
+        else:
+            series = pd.to_numeric(data.get("Close"), errors="coerce").dropna()
+            series = series[[idx.date() < pcf_day for idx in series.index]]
+            if len(chunk) == 1 and not series.empty and float(series.iloc[-1]) > 0:
+                closes[chunk[0]] = float(series.iloc[-1])
+
+    # Retry missing symbols individually. This is slower but only runs for the
+    # small tail that a batch request missed.
+    missing = [symbol for symbol in symbols if symbol not in closes]
+    for symbol in missing:
+        try:
+            hist = yf.Ticker(symbol).history(
+                start=start_day.isoformat(),
+                end=(pcf_day + timedelta(days=1)).isoformat(),
+                auto_adjust=False,
+                actions=False,
+            )
+            if hist is None or hist.empty or "Close" not in hist:
+                continue
+            series = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+            series = series[[idx.date() < pcf_day for idx in series.index]]
+            if not series.empty and float(series.iloc[-1]) > 0:
+                closes[symbol] = float(series.iloc[-1])
+        except Exception:
+            continue
+
+    return closes
+
+
+def _value_vanguard_daily_pcf(frame: pd.DataFrame, source_date: str, etf: str) -> pd.DataFrame:
+    """Turn daily PCF quantities into high-precision basket weights."""
+    out = frame.copy()
+    prices = _vanguard_pcf_previous_closes(out["raw_ticker"].astype(str), source_date)
+
+    missing: list[str] = []
+    for index in out.index:
+        ticker = clean_text(out.at[index, "raw_ticker"])
+        shares = to_float(out.at[index, "shares"])
+        price = prices.get(_yahoo_symbol_for_pcf(ticker))
+        if shares is None or shares <= 0 or price is None or price <= 0:
+            missing.append(ticker)
+            continue
+        out.at[index, "market_value"] = shares * price
+
+    market_value = pd.to_numeric(out["market_value"], errors="coerce")
+    priced = market_value.notna() & (market_value > 0)
+
+    critical = {"NVDA", "AAPL", "MSFT", "AVGO", "MU", "AMD"}
+    missing_critical = sorted(
+        critical.intersection(
+            {canonical_ticker(t) for t in out.loc[~priced, "raw_ticker"].astype(str)}
+        )
+    )
+    if missing_critical:
+        raise HoldingsError(
+            f"VGT: could not price critical PCF holdings {missing_critical}"
+        )
+
+    # Require essentially the whole basket. A few tiny/temporary lines may lack a
+    # Yahoo quote, but we do not silently publish a materially incomplete basket.
+    if int(priced.sum()) < max(MIN_HOLDINGS[etf], math.floor(len(out) * 0.985)):
+        raise HoldingsError(
+            f"VGT: only {int(priced.sum())}/{len(out)} daily PCF securities could be priced; "
+            f"missing examples={missing[:12]}"
+        )
+
+    out = out.loc[priced].copy().reset_index(drop=True)
+    market_value = pd.to_numeric(out["market_value"], errors="coerce")
+    total = float(market_value.sum())
+    if not math.isfinite(total) or total <= 0:
+        raise HoldingsError(f"VGT: invalid daily PCF basket value {total}")
+
+    out["weight"] = market_value / total * 100.0
+    out = out.sort_values("weight", ascending=False).reset_index(drop=True)
+    return out[STD_COLS]
+
+
+def _fetch_vanguard_daily_pcf(
+    session: requests.Session,
+    etf: str,
+    timeout: int,
+) -> FetchResult:
+    """Primary VGT source: Vanguard's daily creation/redemption PCF."""
+    fund_id = VANGUARD_PCF_FUND_IDS.get(etf)
+    if not fund_id:
+        raise HoldingsError(f"{etf}: no Vanguard PCF fund id configured")
+
+    base_params = {
+        "FundId": fund_id,
+        "FundIntExt": "INT",
+        "investor_disable_redirect": "true",
+    }
+    headers = {
+        **HEADERS,
+        "User-Agent": VANGUARD_API_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": VANGUARD_PROFILE_URL.format(ticker=etf.lower()),
+    }
+    errors: list[str] = []
+
+    def request_getter(start: int) -> str:
+        response = session.get(
+            VANGUARD_PCF_URL,
+            params={**base_params, "start": str(start)},
+            headers=headers,
+            timeout=(10, timeout),
+            allow_redirects=True,
+        )
+        if response.status_code != 200:
+            raise HoldingsError(f"PCF HTTP {response.status_code}")
+        if len(response.text) < 500:
+            raise HoldingsError(f"PCF response too small ({len(response.text)} chars)")
+        return response.text
+
+    try:
+        frame, source_date = _fetch_vanguard_pcf_pages(request_getter, etf=etf)
+        valued = _value_vanguard_daily_pcf(frame, source_date, etf)
+        print(
+            f"[VGT] Vanguard DAILY PCF: {len(valued)} priced securities, "
+            f"source_date={source_date}",
+            file=sys.stderr,
+        )
+        return FetchResult(
+            frame=valued,
+            source_date=source_date,
+            precision_method="vanguard_daily_pcf_x_prior_close",
+        )
+    except Exception as exc:
+        errors.append(f"requests PCF: {type(exc).__name__}: {exc}")
+        print(f"[VGT] Direct PCF failed; retrying with curl_cffi: {exc}", file=sys.stderr)
+
+    try:
+        from curl_cffi import requests as cffi_requests
+
+        browser = cffi_requests.Session(impersonate="chrome", headers=headers)
+        try:
+            def cffi_getter(start: int) -> str:
+                response = browser.get(
+                    VANGUARD_PCF_URL,
+                    params={**base_params, "start": str(start)},
+                    timeout=timeout,
+                    allow_redirects=True,
+                )
+                if response.status_code != 200:
+                    raise HoldingsError(f"PCF HTTP {response.status_code}")
+                if len(response.text) < 500:
+                    raise HoldingsError(f"PCF response too small ({len(response.text)} chars)")
+                return response.text
+
+            frame, source_date = _fetch_vanguard_pcf_pages(cffi_getter, etf=etf)
+            valued = _value_vanguard_daily_pcf(frame, source_date, etf)
+            print(
+                f"[VGT] Vanguard DAILY PCF via curl_cffi: {len(valued)} priced securities, "
+                f"source_date={source_date}",
+                file=sys.stderr,
+            )
+            return FetchResult(
+                frame=valued,
+                source_date=source_date,
+                precision_method="vanguard_daily_pcf_curl_x_prior_close",
+            )
+        finally:
+            try:
+                browser.close()
+            except Exception:
+                pass
+    except Exception as exc:
+        errors.append(f"curl_cffi PCF: {type(exc).__name__}: {exc}")
+        print(f"[VGT] curl_cffi PCF failed; retrying with Selenium: {exc}", file=sys.stderr)
+
+    driver = None
+    try:
+        driver = _make_chrome_driver()
+        driver.set_page_load_timeout(max(45, timeout))
+
+        def selenium_getter(start: int) -> str:
+            from urllib.parse import urlencode
+            url = VANGUARD_PCF_URL + "?" + urlencode({**base_params, "start": str(start)})
+            driver.get(url)
+            time.sleep(1.0)
+            return driver.page_source
+
+        frame, source_date = _fetch_vanguard_pcf_pages(selenium_getter, etf=etf)
+        valued = _value_vanguard_daily_pcf(frame, source_date, etf)
+        print(
+            f"[VGT] Vanguard DAILY PCF via Selenium: {len(valued)} priced securities, "
+            f"source_date={source_date}",
+            file=sys.stderr,
+        )
+        return FetchResult(
+            frame=valued,
+            source_date=source_date,
+            precision_method="vanguard_daily_pcf_selenium_x_prior_close",
+        )
+    except Exception as exc:
+        errors.append(f"selenium PCF: {type(exc).__name__}: {exc}")
+    finally:
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+    raise HoldingsError(
+        "VGT: daily Vanguard PCF unavailable: " + " | ".join(errors[-5:])
+    )
 
 
 def _fetch_vanguard_current_api(
@@ -1503,46 +2165,8 @@ def fetch_vanguard(
     etf: str,
     timeout: int,
 ) -> FetchResult:
-    """
-    VGT authoritative-source policy (revision 2026-08-31-v3):
-
-    1. Current Vanguard public JSON holdings API using uppercase ticker and
-       ?start=1&count=50000.
-    2. Vanguard Advisor 'Export full holdings'.
-    3. Vanguard Advisor rendered holdings table.
-    4. Fail.
-
-    VGT weights are NEVER generated from Yahoo prices or stale share counts.
-    """
-    errors: list[str] = []
-
-    try:
-        return _fetch_vanguard_current_api(session, etf, timeout)
-    except Exception as exc:
-        errors.append(f"public API: {type(exc).__name__}: {exc}")
-        print(
-            f"[{etf}] Public Vanguard API failed; trying Advisor export: {exc}",
-            file=sys.stderr,
-        )
-
-    try:
-        return _fetch_vanguard_advisor_export(etf, timeout)
-    except Exception as exc:
-        errors.append(f"advisor export: {type(exc).__name__}: {exc}")
-        print(
-            f"[{etf}] Advisor export failed; trying rendered Advisor table: {exc}",
-            file=sys.stderr,
-        )
-
-    try:
-        return _fetch_vanguard_advisor_dom(etf, timeout)
-    except Exception as exc:
-        errors.append(f"advisor DOM: {type(exc).__name__}: {exc}")
-
-    raise HoldingsError(
-        f"{etf}: authoritative Vanguard holdings unavailable: "
-        + " | ".join(errors[-5:])
-    )
+    """VGT uses Vanguard's DAILY Portfolio Composition File only."""
+    return _fetch_vanguard_daily_pcf(session, etf, timeout)
 
 
 # ----------------------------- iShares / ACWI -----------------------------
@@ -2050,9 +2674,8 @@ def fetch_all_live(
             result = FETCHERS[etf](session, etf, timeout)
             frame = result.frame.copy()
 
-            # VGT CRITICAL CHANGE:
-            # No drift_vgt_live_snapshot(). Vanguard provider weights are used
-            # exactly as published.
+            # VGT uses the CURRENT DAILY Vanguard PCF. Its weights are the
+            # current PCF basket quantities valued at the prior completed close.
             previous_count = len(previous[etf]) if etf in previous else None
             validate_live_frame(etf, frame, previous_count)
             if etf == "VGT":
@@ -2109,13 +2732,10 @@ def run(etfs: list[str], out_dir: Path, combined_name: str, timeout: int) -> int
             fallback = sanitize_previous(previous[etf].copy())
             validate_output(etf, fallback)
 
-            # CRITICAL VGT CHANGE:
-            # Preserve last official Vanguard snapshot EXACTLY. Never Yahoo-drift
-            # it. validate_output() also rejects the old fake non-month-end
-            # source_date such as 2026-08-26.
+            # VGT fallback may only be a recent prior DAILY PCF.
             fallback_mode = "last-known-good"
             if etf == "VGT":
-                fallback_mode = "last official Vanguard month-end snapshot (unchanged)"
+                fallback_mode = "last recent Vanguard DAILY PCF snapshot (unchanged)"
 
             final_by_etf[etf] = fallback[OUTPUT_COLS]
             source_status[etf] = fallback_mode
