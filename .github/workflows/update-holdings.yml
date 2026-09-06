@@ -43,7 +43,7 @@ jobs:
 
       - name: Check Python syntax
         run: |
-          python -m py_compile update_holdings.py
+          python -m py_compile update_holdings.py vgt_profile_pcf.py run_update.py
 
       - name: Create output directory
         run: |
@@ -54,7 +54,7 @@ jobs:
           CHROME_BIN: ${{ steps.chrome.outputs['chrome-path'] }}
           CHROMEDRIVER: ${{ steps.chrome.outputs['chromedriver-path'] }}
         run: |
-          python update_holdings.py \
+          python run_update.py \
             --out-dir data \
             --combined-name ETF_Holdings_Latest.csv \
             VGT ACWI XLF XLI XLC PPH MLPX GRID SOXQ
@@ -169,9 +169,6 @@ jobs:
                   f"({anchor_age} business days)"
               )
 
-          # VGT is now the DAILY Vanguard Portfolio Composition File (PCF),
-          # so it belongs in the same business-day freshness gate as the
-          # other daily / near-daily providers.
           max_lag_business_days = {
               "VGT": 1,
               "ACWI": 1,
@@ -189,8 +186,6 @@ jobs:
           for ticker, allowed_lag in max_lag_business_days.items():
               source_date = source_dates[ticker]
 
-              # A same-day VGT PCF may legitimately be one business day ahead
-              # of a lagging daily anchor during provider publication windows.
               if source_date > anchor_date:
                   lead = weekday_steps(anchor_date, source_date)
                   if ticker == "VGT" and lead <= 1:
