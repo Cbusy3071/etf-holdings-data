@@ -2386,7 +2386,25 @@ def fetch_globalx(session: requests.Session, etf: str, timeout: int) -> FetchRes
         or find_download_link(page.text, str(page.url), href_contains=(".csv",))
     )
     if not csv_url:
-        raise HoldingsError(f"{etf}: Global X holdings CSV link not found")
+        # The redesigned site generates downloads in JavaScript. Its full
+        # holdings dialog is embedded in the server-rendered React page data.
+        from globalx_holdings import read_full_holdings
+
+        try:
+            rows, source_date = read_full_holdings(page.text, etf)
+        except ValueError as exc:
+            raise HoldingsError(str(exc)) from exc
+        parsed = pd.DataFrame(rows)
+        result_all = standardise(
+            parsed,
+            ticker="ticker", name="name", weight="netAssets",
+            shares="shares", mval="marketValue", sedol="sedol",
+        )
+        result_all, precision = recompute_weights(result_all, require_all_market_values=False)
+        return FetchResult(
+            drop_nonsecurity_rows(result_all), source_date,
+            f"globalx_full_dialog_{precision}",
+        )
     response = http_get(session, csv_url, timeout)
     parsed, download_date = parse_download(response, provider="Global X", source_date_hint=source_date)
     result_all = standardise(
